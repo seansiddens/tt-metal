@@ -13,7 +13,10 @@
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <bmm_op.hpp>
 #include <tt-metalium/device.hpp>
+#include <fmt/base.h>
 #include <fmt/core.h>
+
+uint32_t ceil_div(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
 
 using namespace tt::constants;
 using namespace std;
@@ -101,6 +104,7 @@ void matmul_multi_core(
         M,
         N,
         TILE_HW);
+    fmt::print("\nMatmul Multi-Core ===============================\n");
 
     // Set up mesh command queue, workload, device range, and program for multi-core execution
     distributed::MeshCommandQueue& cq = mesh_device->mesh_command_queue();
@@ -336,6 +340,312 @@ void matmul_multi_core(
 
     // Blocking read waits for completion before returning and resizes 'output' as needed
     distributed::EnqueueReadMeshBuffer(cq, output, dst_dram_buffer, true);
+
+    fmt::print("\nMatmul Multi-Core Complete ======================\n");
+}
+
+void matmul_streamk(
+    std::vector<bfloat16>& a,
+    std::vector<bfloat16>& b,
+    std::vector<bfloat16>& output,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K,
+    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
+    uint32_t num_cores = 0) {
+    // Check if the configuration is valid - matrices must be divisible by tile dimensions
+    TT_ASSERT(
+        (M * N) % TILE_HW == 0,
+        "Matrix dimensions M={} and N={} must be divisible by TILE_HW={} to use this matmul implementation",
+        M,
+        N,
+        TILE_HW);
+    fmt::print("\nMatmul StreamK ===============================\n");
+    fmt::print("Matrix dimensions: M={}, N={}, K={}\n", M, N, K);
+    fmt::print("BLK_M={}, BLK_N={}, BLK_K={}\n", TILE_HEIGHT, TILE_WIDTH, TILE_WIDTH);
+
+    // Set up mesh command queue, workload, device range, and program for multi-core execution
+    // distributed::MeshCommandQueue& cq = mesh_device->mesh_command_queue();
+    distributed::MeshWorkload workload;
+    distributed::MeshCoordinateRange device_range = distributed::MeshCoordinateRange(mesh_device->shape());
+    Program program{};
+
+    // Get the compute grid size to determine how many cores are available
+    auto core_grid = mesh_device->compute_with_storage_grid_size();
+    auto num_output_tiles_total = (M * N) / TILE_HW;
+    fmt::print("Total output tiles: {}\n", num_output_tiles_total);
+
+    // Determine which cores to use based on num_cores parameter
+    // If num_cores is 0 or not specified, use all available cores
+    // Otherwise, create a CoreRangeSet with exactly num_cores cores
+    uint32_t max_cores = core_grid.x * core_grid.y;
+    uint32_t target_num_cores = (num_cores == 0 || num_cores > max_cores) ? max_cores : num_cores;
+    fmt::print("Num cores: {}\n", target_num_cores);
+
+    CoreRangeSet all_cores = num_cores_to_corerangeset(target_num_cores, core_grid, true);
+
+    // Extracting Matrix dimensions from input/output vectors and converting to tile coordinates.
+    // The accelerator works with 32x32 tiles, so we need to convert from element dimensions
+    // to tile dimensions for proper addressing and computation.
+    const uint32_t Mt = M / TILE_HEIGHT;  // Number of tiles in M dimension
+    const uint32_t Kt = K / TILE_WIDTH;   // Number of tiles in K dimension
+    const uint32_t Nt = N / TILE_WIDTH;   // Number of tiles in N dimension
+    fmt::print(" Mt: {}, Nt: {}, Kt: {}\n", Mt, Nt, Kt);
+
+    // Create DRAM buffers for input and output matrices (replicated per device across the mesh).
+    // We allocate DRAM buffers for the input matrices and output matrix.
+    // Setting page_size to single_tile_size is the most common configuration for memory buffers in Metalium
+    // as it is generic, works for most cases and achieves good performance.
+    // Writing data from input vectors to source buffers.
+    constexpr uint32_t single_tile_size = sizeof(bfloat16) * TILE_HEIGHT * TILE_WIDTH;  // 2 * 32 * 32 = 2048 bytes
+
+    distributed::DeviceLocalBufferConfig dram_config{
+        .page_size = single_tile_size, .buffer_type = tt_metal::BufferType::DRAM};
+
+    distributed::ReplicatedBufferConfig buffer_config_A{.size = single_tile_size * Mt * Kt};
+
+    distributed::ReplicatedBufferConfig buffer_config_B{.size = single_tile_size * Nt * Kt};
+
+    distributed::ReplicatedBufferConfig buffer_config_C{.size = single_tile_size * Mt * Nt};
+
+    auto src0_dram_buffer = distributed::MeshBuffer::create(buffer_config_A, dram_config, mesh_device.get());
+    auto src1_dram_buffer = distributed::MeshBuffer::create(buffer_config_B, dram_config, mesh_device.get());
+    auto dst_dram_buffer = distributed::MeshBuffer::create(buffer_config_C, dram_config, mesh_device.get());
+    // Each handle is a mesh-wide replicated allocation; on a unit mesh this is a single device buffer
+
+    // Configure Circular Buffers
+    // Circular buffers act as staging areas for data movement between DRAM and compute units.
+    // Using 2 tiles per circular buffer to allow for double buffering (data movement can be reading from one tile while
+    // the compute kernel is using the other tile). This number can be adjusted based on the use case, but generally
+    // diminishing returns are observed after several tiles.
+    // input tiles count is = 2 so one tile can be read while the other is being processed
+    const auto cb_data_format = tt::DataFormat::Float16_b;
+    uint32_t num_input_tiles = 2;
+    tt_metal::CreateCircularBuffer(
+        program,
+        all_cores,  // create on all cores
+        CircularBufferConfig(num_input_tiles * single_tile_size, {{CBIndex::c_0, cb_data_format}})
+            .set_page_size(CBIndex::c_0, single_tile_size));
+
+    tt_metal::CreateCircularBuffer(
+        program,
+        all_cores,  // create on all cores
+        CircularBufferConfig(num_input_tiles * single_tile_size, {{CBIndex::c_1, cb_data_format}})
+            .set_page_size(CBIndex::c_1, single_tile_size));
+
+    tt_metal::CreateCircularBuffer(
+        program,
+        all_cores,  // create on all cores
+        CircularBufferConfig(num_input_tiles * single_tile_size, {{CBIndex::c_16, cb_data_format}})
+            .set_page_size(CBIndex::c_16, single_tile_size));
+
+    // Create Kernels (Reader, Writer, Compute)
+    // - Reader kernel: Handles reading input data from DRAM into circular buffers
+    // - Writer kernel: Handles writing output data from circular buffers back to DRAM
+    // - Compute kernel: Performs the actual matrix multiplication computation
+    // All kernels run across all cores to enable parallel execution
+    MathFidelity math_fidelity = MathFidelity::HiFi4;  // High fidelity math for accurate results
+    std::vector<uint32_t> reader_compile_time_args;
+    TensorAccessorArgs(*src0_dram_buffer).append_to(reader_compile_time_args);
+    TensorAccessorArgs(*src1_dram_buffer).append_to(reader_compile_time_args);
+    auto reader_id = tt_metal::CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "streamk/matmul_multicore_utilization/kernels/dataflow/streamk_reader.cpp",
+        all_cores,
+        tt_metal::DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_1,
+            .noc = NOC::RISCV_1_default,
+            .compile_args = reader_compile_time_args});
+
+    std::vector<uint32_t> writer_compile_time_args;
+    TensorAccessorArgs(*dst_dram_buffer).append_to(writer_compile_time_args);
+    auto writer_id = tt_metal::CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "streamk/matmul_multicore_utilization/kernels/dataflow/streamk_writer.cpp",
+        all_cores,
+        tt_metal::DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_0,
+            .noc = NOC::RISCV_0_default,
+            .compile_args = writer_compile_time_args});
+
+    auto compute_kernel_id = tt_metal::CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "streamk/matmul_multicore_utilization/kernels/compute/streamk_mm.cpp",
+        all_cores,
+        tt_metal::ComputeConfig{.math_fidelity = math_fidelity, .compile_args = {}});
+
+    // Set Runtime Arguments for Kernels
+    // Each core needs to know which portion of the work it's responsible for. We are parallelizing across output
+    // tiles - each core computes different output tiles. Runtime arguments can be changed between program executions
+    // without recompilation.
+    uint32_t work_offset = 0;
+
+    fmt::print("\nWork distribution across cores:\n");
+
+    // StreamK work distribution.
+    uint32_t macs_per_tile = ceil_div(K, TILE_WIDTH);  // MAC iters (A_mk * B_kn) per outut tile C_mn
+    uint32_t total_macs = ceil_div(M, TILE_HEIGHT) * ceil_div(N, TILE_WIDTH) * macs_per_tile;
+    uint32_t macs_per_core = ceil_div(total_macs, target_num_cores);  // # of MACs each core is responsible for.
+
+    fmt::print("MACs per tile: {}\n", macs_per_tile);
+    fmt::print("Total MACs: {}\n", total_macs);
+    fmt::print("MACs per core: {}\n", macs_per_core);
+
+    uint32_t core_idx = 0;
+    for (const auto& range : all_cores.ranges()) {
+        for (const auto& core : range) {
+            fmt::print("Core {} ({}, {})\n", core_idx, core.x, core.y);
+
+            uint32_t mac_start = core_idx * macs_per_core;
+            uint32_t mac_end = std::min(mac_start + macs_per_core, total_macs);
+            fmt::print("  MAC range: [{}, {})\n", mac_start, mac_end);
+
+            // Determine which output tiles this core works on
+            uint32_t first_tile = mac_start / macs_per_tile;
+            uint32_t last_tile = (mac_end - 1) / macs_per_tile;
+
+            fmt::print(
+                "  Output tiles touched: {} to {} (count: {})\n", first_tile, last_tile, last_tile - first_tile + 1);
+
+            // For each tile, check if this core does first/last MAC iteration
+            for (uint32_t tile_idx = first_tile; tile_idx <= last_tile; ++tile_idx) {
+                uint32_t tile_mac_start = tile_idx * macs_per_tile;
+                uint32_t tile_mac_end = tile_mac_start + macs_per_tile;
+
+                // Compute this core's MAC range for this specific tile
+                uint32_t core_tile_mac_start = std::max(mac_start, tile_mac_start);
+                uint32_t core_tile_mac_end = std::min(mac_end, tile_mac_end);
+
+                // Check if this core does the first or last MAC for this tile
+                bool tile_started = (core_tile_mac_start == tile_mac_start);
+                bool tile_finished = (core_tile_mac_end == tile_mac_end);
+
+                // K-iteration range within this tile
+                uint32_t k_start = core_tile_mac_start - tile_mac_start;
+                uint32_t k_end = core_tile_mac_end - tile_mac_start;
+
+                fmt::print(
+                    "    Tile {}: K-iters [{}, {}), started={}, finished={}\n",
+                    tile_idx,
+                    k_start,
+                    k_end,
+                    tile_started,
+                    tile_finished);
+            }
+
+            // Set arguments for the reader kernel (data input)
+            tt_metal::SetRuntimeArgs(
+                program,
+                reader_id,
+                core,
+                {
+                    src0_dram_buffer->address(),  // Address of matrix A in DRAM
+                    src1_dram_buffer->address(),  // Address of matrix B in DRAM
+                    Mt,                           // Number of tiles in M dimension
+                    Kt,                           // Number of tiles in K dimension
+                    Nt,                           // Number of tiles in N dimension
+                    target_num_cores,             // Total number of cores
+                });
+
+            core_idx++;
+            fmt::print("\n");
+        }
+    }
+
+    // // Iterate through each work group and assign work to cores
+    // for (const auto& [ranges, work_per_core] : work_groups) {
+    //     for (const auto& range : ranges.ranges()) {
+    //         for (const auto& core : range) {
+    //             // Calculate MAC iterations for this core (output tiles * K-tile dimension)
+    //             uint32_t mac_iters = work_per_core * Kt;
+    //             uint32_t end_tile = work_offset + work_per_core - 1;
+
+    //             // Print the work distribution for this core
+    //             fmt::print(
+    //                 "  Core {} ({}, {}): output tiles [{}, {}] (count: {}), MAC iters: {}\n",
+    //                 core_idx,
+    //                 core.x,
+    //                 core.y,
+    //                 work_offset,
+    //                 end_tile,
+    //                 work_per_core,
+    //                 mac_iters);
+
+    //             // Set arguments for the reader kernel (data input)
+    //             tt_metal::SetRuntimeArgs(
+    //                 program,
+    //                 reader_id,
+    //                 core,
+    //                 {src0_dram_buffer->address(),  // Address of matrix A in DRAM
+    //                  src1_dram_buffer->address(),  // Address of matrix B in DRAM
+    //                  Mt,                           // Number of tiles in M dimension
+    //                  Kt,                           // Number of tiles in K dimension
+    //                  Nt,                           // Number of tiles in N dimension
+    //                  work_offset,                  // Starting offset for this core's work
+    //                  work_per_core});              // Amount of work for this core
+
+    //             // Set arguments for the writer kernel (data output)
+    //             tt_metal::SetRuntimeArgs(
+    //                 program, writer_id, core, {dst_dram_buffer->address(), work_per_core, work_offset});
+
+    //             // Set arguments for the compute kernel
+    //             tt_metal::SetRuntimeArgs(
+    //                 program,
+    //                 compute_kernel_id,
+    //                 core,
+    //                 {work_per_core,            // Amount of work for this core
+    //                  Kt});                     // Number of tiles in K dimension for dot product
+    //             work_offset += work_per_core;  // Update offset for next core
+    //             core_idx++;
+    //         }
+    //     }
+    // }
+    // fmt::print("\n");
+
+    // // Launch program & read in output buffer result into the host vector
+    // // 1. Upload input data to DRAM buffers
+    // // 2. Execute the program (all kernels run in parallel across cores)
+    // // 3. Read back the result from DRAM to host memory
+    // // The 'true' parameter in EnqueueReadMeshBuffer ensures we wait for completion (so when the function
+    // // returns, the output vector is fully populated).
+    // distributed::EnqueueWriteMeshBuffer(cq, src0_dram_buffer, a, false);
+    // distributed::EnqueueWriteMeshBuffer(cq, src1_dram_buffer, b, false);
+    // workload.add_program(device_range, std::move(program));
+
+    // // Warmup iterations (not recorded)
+    // constexpr uint32_t warmup_iterations = 10;
+    // fmt::print("Running {} warmup iterations...\n", warmup_iterations);
+    // for (uint32_t iter = 0; iter < warmup_iterations; ++iter) {
+    //     distributed::EnqueueMeshWorkload(cq, workload, true);
+    // }
+
+    // // Benchmark iterations with timing
+    // constexpr uint32_t bench_iterations = 10;
+    // std::vector<int64_t> execution_times;
+    // execution_times.reserve(bench_iterations);
+
+    // fmt::print("Running {} benchmark iterations...\n", bench_iterations);
+    // for (uint32_t iter = 0; iter < bench_iterations; ++iter) {
+    //     auto start_time = std::chrono::high_resolution_clock::now();
+    //     distributed::EnqueueMeshWorkload(cq, workload, true);
+    //     auto end_time = std::chrono::high_resolution_clock::now();
+    //     auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    //     execution_times.push_back(elapsed_us);
+    // }
+
+    // // Print individual times and calculate average
+    // fmt::print("\nExecution times:\n");
+    // int64_t total_us = 0;
+    // for (size_t i = 0; i < execution_times.size(); ++i) {
+    //     fmt::print("  Iteration {}: {} us ({:.3f} ms)\n", i, execution_times[i], execution_times[i] / 1000.0);
+    //     total_us += execution_times[i];
+    // }
+    // double avg_us = static_cast<double>(total_us) / execution_times.size();
+    // fmt::print("Average execution time: {:.2f} us ({:.3f} ms)\n\n", avg_us, avg_us / 1000.0);
+
+    // // Blocking read waits for completion before returning and resizes 'output' as needed
+    // distributed::EnqueueReadMeshBuffer(cq, output, dst_dram_buffer, true);
+    fmt::print("\nMatmul StreamK Complete ======================\n");
 }
 
 ///////////////////////////////////////
@@ -426,6 +736,8 @@ int main(int argc, char** argv) {
         float pearson = check_bfloat16_vector_pcc(golden_vec, result_vec);
         fmt::print("Metalium vs Golden -- PCC = {}\n", pearson);
         TT_FATAL(pearson > 0.97, "PCC not high enough. Result PCC: {}, Expected PCC: 0.97", pearson);
+
+        matmul_streamk(src0_vec, src1_vec, result_vec, M, N, K, mesh_device, num_cores);
 
         pass &= mesh_device->close();
 
