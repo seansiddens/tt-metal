@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
-//
-// SPDX-License-Identifier: Apache-2.0
-
 #include <cstdint>
 #include "compute_kernel_api/tile_move_copy.h"
 #include "compute_kernel_api/matmul.h"
@@ -36,8 +32,22 @@ namespace NAMESPACE {
  * the appropriate tiles for each output tile computation.
  */
 void MAIN {
-    uint32_t num_output_tiles = get_arg_val<uint32_t>(0);  // number of output tiles to produce
-    uint32_t Kt = get_arg_val<uint32_t>(1);                // number of tiles in K dimension for dot product
+    // uint32_t num_output_tiles = get_arg_val<uint32_t>(0);  // number of output tiles to produce
+    // uint32_t Kt = get_arg_val<uint32_t>(1);                // number of tiles in K dimension for dot product
+
+    uint32_t arg_idx = 0;
+    uint32_t src0_addr = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t src1_addr = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t Mt = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t Kt = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t Nt = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t num_cores = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t total_output_tiles = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t macs_per_tile = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t macs_per_core = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t total_macs = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t mac_start = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t mac_end = get_arg_val<uint32_t>(arg_idx++);
 
     constexpr tt::CBIndex cb_in0 = tt::CBIndex::c_0;
     constexpr tt::CBIndex cb_in1 = tt::CBIndex::c_1;
@@ -47,37 +57,54 @@ void MAIN {
     // and output circular buffers.
     mm_init(cb_in0, cb_in1, cb_out);
 
-    // the simplest possible version of outer product blocked matmul
-    // the reader is expected to read the A's and B's tile rows and tile columns for each output tile
-    for (uint32_t i = 0; i < num_output_tiles; ++i) {
-        // Make sure registers can be used for the output tile. This also sets the registers to zero.
-        tile_regs_acquire();
-        for (uint32_t kt = 0; kt < Kt; kt++) {
-            // Wait for the input tiles to be available in the input circular buffers.
-            cb_wait_front(cb_in0, 1);
-            cb_wait_front(cb_in1, 1);
+    // Stream-K compute kernel: Process MAC iterations assigned to this core.
+    uint32_t prev_tile_idx = UINT32_MAX;  // Track previous tile to detect transitions
 
-            // Perform the matrix multiplication for the current tile.
-            // NOTE: This function also accumulates the result into the destination tile.
-            matmul_tiles(cb_in0, cb_in1, 0, 0, 0);
+    for (uint32_t mac_iter = mac_start; mac_iter < mac_end; mac_iter++) {
+        // Determine which output tile and K iteration this MAC belongs to
+        uint32_t tile_idx = mac_iter / macs_per_tile;
+        uint32_t k_idx = mac_iter % macs_per_tile;
 
-            // Mark the input tiles as used by popping them from the front of the circular buffers.
-            cb_pop_front(cb_in0, 1);
-            cb_pop_front(cb_in1, 1);
+        // Check if we're transitioning to a new output tile
+        if (tile_idx != prev_tile_idx) {
+            // Finish and write the previous tile (if not first iteration)
+            if (prev_tile_idx != UINT32_MAX) {
+                tile_regs_commit();
+                tile_regs_wait();
+
+                cb_reserve_back(cb_out, 1);
+                pack_tile(0, cb_out);
+                cb_push_back(cb_out, 1);
+
+                tile_regs_release();
+            }
+
+            // Start accumulating a new output tile
+            tile_regs_acquire();
+            prev_tile_idx = tile_idx;
         }
 
-        // Commit and wait for the registers are populated with the results from the FPU
+        // Wait for the input tiles (A and B) from the reader
+        cb_wait_front(cb_in0, 1);
+        cb_wait_front(cb_in1, 1);
+
+        // Perform the tile-wise matrix multiplication (accumulates into registers)
+        matmul_tiles(cb_in0, cb_in1, 0, 0, 0);
+
+        // Pop the input tiles since we've consumed them
+        cb_pop_front(cb_in0, 1);
+        cb_pop_front(cb_in1, 1);
+    }
+
+    // Write the final output tile
+    if (prev_tile_idx != UINT32_MAX) {
         tile_regs_commit();
         tile_regs_wait();
 
-        // Ensure the output circular buffer has space for the result tile.
         cb_reserve_back(cb_out, 1);
-        // Pack the result tile into the output circular buffer.
         pack_tile(0, cb_out);
-        // Mark the output tile as ready so the writer can read it.
         cb_push_back(cb_out, 1);
 
-        // We don't need the registers anymore, so we can release them and prepare for the next output tile.
         tile_regs_release();
     }
 }
