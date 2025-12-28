@@ -439,6 +439,16 @@ void matmul_streamk(
         CircularBufferConfig(num_input_tiles * single_tile_size, {{CBIndex::c_16, cb_data_format}})
             .set_page_size(CBIndex::c_16, single_tile_size));
 
+    // Partials CB: used to exchange partial tiles between paired cores
+    tt_metal::CreateCircularBuffer(
+        program,
+        all_cores,  // create on all cores
+        CircularBufferConfig(num_input_tiles * single_tile_size, {{CBIndex::c_2, cb_data_format}})
+            .set_page_size(CBIndex::c_2, single_tile_size));
+
+    // Semaphore: per-core synchronization for partials handling
+    auto partials_ready_sem = tt_metal::CreateSemaphore(program, all_cores, 0);
+
     // Create Kernels (Reader, Writer, Compute)
     // - Reader kernel: Handles reading input data from DRAM into circular buffers
     // - Writer kernel: Handles writing output data from circular buffers back to DRAM
@@ -480,6 +490,9 @@ void matmul_streamk(
     // without recompilation.
     fmt::print("\nWork distribution across cores:\n");
 
+    // Validation: ensure each output tile is touched by at most two cores.
+    std::vector<uint32_t> tile_core_touch_counts(num_output_tiles_total, 0);
+
     // StreamK work distribution.
     uint32_t macs_per_tile = ceil_div(K, TILE_WIDTH);  // MAC iters (A_mk * B_kn) per outut tile C_mn
     uint32_t total_macs = ceil_div(M, TILE_HEIGHT) * ceil_div(N, TILE_WIDTH) * macs_per_tile;
@@ -490,9 +503,26 @@ void matmul_streamk(
     fmt::print("MACs per core: {}\n", macs_per_core);
 
     uint32_t core_idx = 0;
+    CoreCoord prev_core_logical = CoreCoord{0, 0};
+    CoreCoord prev_core_physical = CoreCoord{0, 0};
     for (const auto& range : all_cores.ranges()) {
         for (const auto& core : range) {
-            fmt::print("Core {} ({}, {})\n", core_idx, core.x, core.y);
+            // Convert logical coordinates to physical coordinates for NoC addressing
+            CoreCoord core_physical = mesh_device->worker_core_from_logical_core(core);
+            uint32_t my_x = core_physical.x;
+            uint32_t my_y = core_physical.y;
+            uint32_t peer_x = (core_idx == 0) ? core_physical.x : prev_core_physical.x;
+            uint32_t peer_y = (core_idx == 0) ? core_physical.y : prev_core_physical.y;
+
+            fmt::print(
+                "Core {} logical ({}, {}), physical ({}, {}), Peer physical: ({}, {})\n",
+                core_idx,
+                core.x,
+                core.y,
+                core_physical.x,
+                core_physical.y,
+                peer_x,
+                peer_y);
 
             uint32_t mac_start = core_idx * macs_per_core;
             uint32_t mac_end = std::min(mac_start + macs_per_core, total_macs);
@@ -529,6 +559,28 @@ void matmul_streamk(
                     k_end,
                     tile_started,
                     tile_finished);
+
+                // Count how many distinct cores touch this tile (non-empty K range).
+                if (core_tile_mac_end > core_tile_mac_start) {
+                    uint32_t new_count = ++tile_core_touch_counts[tile_idx];
+                    if (new_count > 2) {
+                        fmt::print(
+                            stderr,
+                            "Error: Output tile {} is touched by more than two cores ({}). Core {} ({}, {}) MAC range "
+                            "[{}, {}) contributes K-iters [{}, {}).\n",
+                            tile_idx,
+                            new_count,
+                            core_idx,
+                            core.x,
+                            core.y,
+                            mac_start,
+                            mac_end,
+                            k_start,
+                            k_end);
+                        TT_FATAL(
+                            false, "StreamK invalid work split: tile {} touched by {} cores (>2)", tile_idx, new_count);
+                    }
+                }
             }
 
             // Set arguments for the reader kernel (data input)
@@ -544,11 +596,16 @@ void matmul_streamk(
                     Nt,                           // Number of tiles in N dimension
                     target_num_cores,             // Total number of cores
                     num_output_tiles_total,
-                    macs_per_tile,  // MAC iters per output tile
-                    macs_per_core,  // MAC iters per core
-                    total_macs,     // Total number of MAC iterations across whole problem
-                    mac_start,      // Starting MAC iteration for this core
-                    mac_end,        // Ending MAC iteration for this core
+                    macs_per_tile,      // MAC iters per output tile
+                    macs_per_core,      // MAC iters per core
+                    total_macs,         // Total number of MAC iterations across whole problem
+                    mac_start,          // Starting MAC iteration for this core
+                    mac_end,            // Ending MAC iteration for this core
+                    my_x,               // This core's x
+                    my_y,               // This core's y
+                    peer_x,             // Peer core's x (previous core)
+                    peer_y,             // Peer core's y (previous core)
+                    partials_ready_sem  // partials_ready_sem id
                 });
 
             tt_metal::SetRuntimeArgs(
@@ -563,11 +620,16 @@ void matmul_streamk(
                     Nt,                           // Number of tiles in N dimension
                     target_num_cores,             // Total number of cores
                     num_output_tiles_total,
-                    macs_per_tile,  // MAC iters per output tile
-                    macs_per_core,  // MAC iters per core
-                    total_macs,     // Total number of MAC iterations across whole problem
-                    mac_start,      // Starting MAC iteration for this core
-                    mac_end,        // Ending MAC iteration for this core
+                    macs_per_tile,      // MAC iters per output tile
+                    macs_per_core,      // MAC iters per core
+                    total_macs,         // Total number of MAC iterations across whole problem
+                    mac_start,          // Starting MAC iteration for this core
+                    mac_end,            // Ending MAC iteration for this core
+                    my_x,               // This core's x
+                    my_y,               // This core's y
+                    peer_x,             // Peer core's x (previous core)
+                    peer_y,             // Peer core's y (previous core)
+                    partials_ready_sem  // partials_ready_sem id
                 });
 
             tt_metal::SetRuntimeArgs(
@@ -581,15 +643,22 @@ void matmul_streamk(
                     Nt,                          // Number of tiles in N dimension
                     target_num_cores,            // Total number of cores
                     num_output_tiles_total,
-                    macs_per_tile,  // MAC iters per output tile
-                    macs_per_core,  // MAC iters per core
-                    total_macs,     // Total number of MAC iterations across whole problem
-                    mac_start,      // Starting MAC iteration for this core
-                    mac_end,        // Ending MAC iteration for this core
+                    macs_per_tile,      // MAC iters per output tile
+                    macs_per_core,      // MAC iters per core
+                    total_macs,         // Total number of MAC iterations across whole problem
+                    mac_start,          // Starting MAC iteration for this core
+                    mac_end,            // Ending MAC iteration for this core
+                    my_x,               // This core's x
+                    my_y,               // This core's y
+                    peer_x,             // Peer core's x (previous core)
+                    peer_y,             // Peer core's y (previous core)
+                    partials_ready_sem  // partials_ready_sem id
                 });
 
+            // Update previous core for next iteration (both logical and physical)
+            prev_core_logical = core;
+            prev_core_physical = core_physical;
             core_idx++;
-            fmt::print("\n");
         }
     }
 

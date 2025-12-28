@@ -18,9 +18,15 @@ void kernel_main() {
     uint32_t total_macs = get_arg_val<uint32_t>(arg_idx++);
     uint32_t mac_start = get_arg_val<uint32_t>(arg_idx++);
     uint32_t mac_end = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t my_x = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t my_y = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t peer_x = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t peer_y = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t partials_ready_sem = get_arg_val<uint32_t>(arg_idx++);
 
     constexpr uint32_t cb_id_in0 = tt::CBIndex::c_0;
     constexpr uint32_t cb_id_in1 = tt::CBIndex::c_1;
+    constexpr uint32_t cb_id_partials = tt::CBIndex::c_2;
 
     // Declare address in which we stored the source matrices. We have set the exact same format between CBs and DRAM
     // buffers in the host code, so we can use the same address for both DRAM and CBs.
@@ -35,38 +41,51 @@ void kernel_main() {
 
     // Stream-K: Iterate through MAC iterations assigned to this core.
     // Each MAC iteration corresponds to one K iteration of one output tile.
-    for (uint32_t mac_iter = mac_start; mac_iter < mac_end; mac_iter++) {
+    uint32_t mac_iter = mac_start;
+    while (mac_iter < mac_end) {
         // Determine which output tile this MAC iteration belongs to
         uint32_t tile_idx = mac_iter / macs_per_tile;
+        uint32_t tile_iter_start = tile_idx * macs_per_tile;
+        uint32_t tile_iter_end = tile_iter_start + macs_per_tile;
 
-        // Determine which K iteration within that tile (MAC index within the tile)
-        uint32_t k_idx = mac_iter % macs_per_tile;
+        // Determine the range of MAC iters for this tile that this core needs to process
+        uint32_t local_iter = mac_iter - tile_iter_start;
+        uint32_t local_iter_end =
+            (mac_end < tile_iter_end) ? (mac_end - tile_iter_start) : (tile_iter_end - tile_iter_start);
 
         // Convert linear tile index to 2D output coordinates
         uint32_t out_row = tile_idx / Nt;  // Which row in output matrix
         uint32_t out_col = tile_idx % Nt;  // Which column in output matrix
 
-        // Calculate which A and B tiles are needed for this (out_row, out_col, k_idx) computation
-        // A is laid out as [Mt x Kt], B is laid out as [Kt x Nt]
-        uint32_t tile_A = out_row * Kt + k_idx;  // A tile at (out_row, k_idx)
-        uint32_t tile_B = k_idx * Nt + out_col;  // B tile at (k_idx, out_col)
+        // Inner loop: fetch input tiles for each K iteration in the local range
+        for (uint32_t k_idx = local_iter; k_idx < local_iter_end; k_idx++) {
+            // Calculate which A and B tiles are needed for this (out_row, out_col, k_idx) computation
+            // A is laid out as [Mt x Kt], B is laid out as [Kt x Nt]
+            uint32_t tile_A = out_row * Kt + k_idx;  // A tile at (out_row, k_idx)
+            uint32_t tile_B = k_idx * Nt + out_col;  // B tile at (k_idx, out_col)
 
-        // Read A tile from DRAM into circular buffer
-        {
-            cb_reserve_back(cb_id_in0, 1);
-            uint32_t l1_write_addr_in0 = get_write_ptr(cb_id_in0);
-            noc_async_read_tile(tile_A, a, l1_write_addr_in0);
-            noc_async_read_barrier();
-            cb_push_back(cb_id_in0, 1);
+            // Read A tile from DRAM into circular buffer
+            {
+                cb_reserve_back(cb_id_in0, 1);
+                uint32_t l1_write_addr_in0 = get_write_ptr(cb_id_in0);
+                noc_async_read_tile(tile_A, a, l1_write_addr_in0);
+                noc_async_read_barrier();
+                cb_push_back(cb_id_in0, 1);
+                // DPRINT << "Sent tile A for tile_idx " << tile_idx << ", k_idx " << k_idx << ENDL();
+            }
+
+            // Read B tile from DRAM into circular buffer
+            {
+                cb_reserve_back(cb_id_in1, 1);
+                uint32_t l1_write_addr_in1 = get_write_ptr(cb_id_in1);
+                noc_async_read_tile(tile_B, b, l1_write_addr_in1);
+                noc_async_read_barrier();
+                cb_push_back(cb_id_in1, 1);
+                // DPRINT << "Sent tile B for tile_idx " << tile_idx << ", k_idx " << k_idx << ENDL();
+            }
         }
 
-        // Read B tile from DRAM into circular buffer
-        {
-            cb_reserve_back(cb_id_in1, 1);
-            uint32_t l1_write_addr_in1 = get_write_ptr(cb_id_in1);
-            noc_async_read_tile(tile_B, b, l1_write_addr_in1);
-            noc_async_read_barrier();
-            cb_push_back(cb_id_in1, 1);
-        }
+        mac_iter = tile_iter_end;
     }
+    DPRINT << "Reader finished all work." << ENDL();
 }
