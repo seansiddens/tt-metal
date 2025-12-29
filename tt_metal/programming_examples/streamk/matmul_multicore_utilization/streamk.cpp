@@ -667,12 +667,26 @@ void matmul_streamk(
     distributed::EnqueueWriteMeshBuffer(cq, src1_dram_buffer, b, false);
     workload.add_program(device_range, std::move(program));
 
+    // Time the kernel execution (same as baseline)
+    auto start_time = std::chrono::high_resolution_clock::now();
     distributed::EnqueueMeshWorkload(cq, workload, true);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
 
     // Read back the result from DRAM to host memory
     distributed::EnqueueReadMeshBuffer(cq, output, dst_dram_buffer, true);
 
     fmt::print("Execution complete!\n");
+
+    // Calculate and print performance metrics
+    double time_ms = elapsed_us / 1000.0;
+    double flops = 2.0 * M * N * K;  // multiply-add
+    double time_s = elapsed_us / 1e6;
+    double tflops = flops / (time_s * 1e12);
+
+    fmt::print("\nStreamK Performance:\n");
+    fmt::print("  Kernel execution time: {} us ({:.3f} ms)\n", elapsed_us, time_ms);
+    fmt::print("  Throughput:            {:.3f} TFLOPs\n", tflops);
 
     fmt::print("\nMatmul StreamK Complete ======================\n");
 }
