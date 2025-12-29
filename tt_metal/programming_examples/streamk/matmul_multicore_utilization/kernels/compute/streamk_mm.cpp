@@ -1,6 +1,9 @@
 #include <cstdint>
 #include "compute_kernel_api/tile_move_copy.h"
 #include "compute_kernel_api/matmul.h"
+#include "compute_kernel_api/common.h"
+#include "compute_kernel_api/eltwise_binary.h"
+#include "debug/dprint.h"
 
 using std::uint32_t;
 
@@ -34,7 +37,6 @@ namespace NAMESPACE {
 void MAIN {
     // uint32_t num_output_tiles = get_arg_val<uint32_t>(0);  // number of output tiles to produce
     // uint32_t Kt = get_arg_val<uint32_t>(1);                // number of tiles in K dimension for dot product
-
     uint32_t arg_idx = 0;
     uint32_t src0_addr = get_arg_val<uint32_t>(arg_idx++);
     uint32_t src1_addr = get_arg_val<uint32_t>(arg_idx++);
@@ -58,6 +60,8 @@ void MAIN {
     constexpr tt::CBIndex cb_in1 = tt::CBIndex::c_1;
     constexpr tt::CBIndex cb_out = tt::CBIndex::c_16;
     constexpr tt::CBIndex cb_id_partials = tt::CBIndex::c_2;
+
+    constexpr uint32_t dst_reg = 0;
 
     // Setup the FPU (matrix engine) for the matmul operation. And specify the input
     // and output circular buffers.
@@ -87,7 +91,7 @@ void MAIN {
             cb_wait_front(cb_in1, 1);
 
             // Perform the tile-wise matrix multiplication (acumulates into registers)
-            matmul_tiles(cb_in0, cb_in1, 0, 0, 0);
+            matmul_tiles(cb_in0, cb_in1, 0, 0, dst_reg);
 
             // Pop the input tiles since we've consumed them
             cb_pop_front(cb_in0, 1);
@@ -99,6 +103,7 @@ void MAIN {
         bool tile_ended = (iter_end >= tile_iter_end);
 
         if (!tile_started) {
+            // PARTIAL REMOTE-SEND PHASE
             // This core didn't start the tile, so send partials to the writer
             // Writer will forward these to the core that started this tile
             // DPRINT_PACK(DPRINT << "Compute: Before tile_regs_commit (sender) for tile " << tile_idx << ENDL());
@@ -115,35 +120,75 @@ void MAIN {
         } else {
             // This core started the tile
             if (!tile_ended) {
-                // ▷ accumulate partial sums from other cores contributing to this tile
+                // PARTIALs REMOTE-RECEIVE PHASE
+                // accumulate partial sums from other cores contributing to this tile
                 // This core started but didn't finish the tile, so wait for partials from later cores
-                // TODO: cta_end ← tile_iter_end / macs_per_tile
+                binary_op_init_common(cb_id_partials, cb_out, cb_out);
+                // add_tiles_init(cb_id_partials, cb_out);
 
-                // DPRINT_PACK(DPRINT << "Compute: Before cb_wait_front(cb_id_partials) for tile " << tile_idx <<
-                // ENDL());
+                // Wait for partials to arrive from other cores.
+                DPRINT_PACK(DPRINT << "Compute: Before cb_wait_front(cb_id_partials) for tile " << tile_idx << ENDL());
                 cb_wait_front(cb_id_partials, 1);
-                // DPRINT_PACK(DPRINT << "Compute: After cb_wait_front(cb_id_partials) for tile " << tile_idx <<
-                // ENDL());
-                cb_pop_front(cb_id_partials, 1);
+                DPRINT_PACK(DPRINT << "Compute: After cb_wait_front(cb_id_partials) for tile " << tile_idx << ENDL());
 
-                // After accumulating all partials, store the final tile
+                // pack_tile(dst_reg, cb_out);
+
+                // // Print full PARTIALS tile contents (packer RISC with wr_ptr)
+                // DPRINT_PACK(DPRINT << "===== PARTIALS TILE " << tile_idx << " =====" << ENDL());
+                // for (uint8_t r = 0; r < 32; ++r) {
+                //     SliceRange sr = SliceRange{.h0 = r, .h1 = static_cast<uint8_t>(r + 1), .hs = 1, .w0 = 0, .w1 =
+                //     32, .ws = 1}; DPRINT_PACK({ DPRINT << "Partials Row " << (uint)r << ": " <<
+                //     TileSlice(cb_id_partials, 0, sr, true, false) << ENDL(); });
+                // }
+
+                // // Print full OUT tile contents BEFORE add (it should have accumulated data from this core's MACs)
+                // DPRINT_PACK(DPRINT << "===== OUT TILE " << tile_idx << " BEFORE ADD =====" << ENDL());
+                // for (uint8_t r = 0; r < 32; ++r) {
+                //     SliceRange sr = SliceRange{.h0 = r, .h1 = static_cast<uint8_t>(r + 1), .hs = 1, .w0 = 0, .w1 =
+                //     32, .ws = 1}; DPRINT_PACK({ DPRINT << "OutBefore Row " << (uint)r << ": " << TileSlice(cb_out, 0,
+                //     sr, true, false) << ENDL(); });
+                // }
+
+                // // Pack regs to cb_out
+                // tile_regs_acquire();
+                // add_tiles(cb_id_partials, cb_out, 0, 0, dst_reg);
+
+                tile_regs_acquire();
+                binary_dest_reuse_tiles_init<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_id_partials);
+                binary_dest_reuse_tiles<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_id_partials, 0, dst_reg);
+
+                // Release the held register
                 tile_regs_commit();
                 tile_regs_wait();
 
-                // DPRINT_PACK(DPRINT << "Compute: Before cb_reserve_back(cb_out) for tile " << tile_idx << ENDL());
+                DPRINT_PACK(DPRINT << "Compute: Before cb_reserve_back(cb_out) for tile " << tile_idx << ENDL());
                 cb_reserve_back(cb_out, 1);
-                // DPRINT_PACK(DPRINT << "Compute: After cb_reserve_back(cb_out) for tile " << tile_idx << ENDL());
-                pack_tile(0, cb_out);
+                DPRINT_PACK(DPRINT << "Compute: After cb_reserve_back(cb_out) for tile " << tile_idx << ENDL());
+                pack_tile(dst_reg, cb_out);
+
+                // // Print full OUT tile contents AFTER pack to CB
+                // DPRINT_PACK(DPRINT << "===== OUT TILE " << tile_idx << " AFTER ADD AND PACK =====" << ENDL());
+                // for (uint8_t r = 0; r < 32; ++r) {
+                //     SliceRange sr = SliceRange{.h0 = r, .h1 = static_cast<uint8_t>(r + 1), .hs = 1, .w0 = 0, .w1 =
+                //     32, .ws = 1}; DPRINT_PACK({ DPRINT << "OutAfter Row " << (uint)r << ": " << TileSlice(cb_out, 0,
+                //     sr, true, false) << ENDL(); });
+                // }
+
                 cb_push_back(cb_out, 1);
+                // DPRINT_PACK(DPRINT << "Compute: After cb_push_back(cb_out) for tile " << tile_idx << ENDL());
 
                 tile_regs_release();
+                cb_pop_front(cb_id_partials, 1);
+
+                // Reset SFPU state for mm
+                mm_init(cb_in0, cb_in1, cb_out);
             } else {
                 // tile_started && tile_ended: this core both starts and finishes the tile (simple case)
                 tile_regs_commit();
                 tile_regs_wait();
 
                 cb_reserve_back(cb_out, 1);
-                pack_tile(0, cb_out);
+                pack_tile(dst_reg, cb_out);
                 cb_push_back(cb_out, 1);
 
                 tile_regs_release();

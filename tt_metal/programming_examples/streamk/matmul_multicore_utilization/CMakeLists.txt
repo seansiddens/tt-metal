@@ -1,5 +1,5 @@
 add_executable(streamk)
-target_sources(streamk PRIVATE matmul_multi_core.cpp)
+target_sources(streamk PRIVATE streamk.cpp)
 
 if(NOT TARGET TT::Metalium)
     find_package(TT-Metalium REQUIRED)

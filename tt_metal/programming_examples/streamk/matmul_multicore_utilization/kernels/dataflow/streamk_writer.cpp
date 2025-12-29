@@ -48,18 +48,18 @@ void kernel_main() {
         bool tile_ended = (iter_end >= tile_iter_end);
 
         if (!tile_started) {
-            // ▷ send partials to final core responsible for this tile
-            // This core didn't start the tile, so it needs to send its accumulated partials
-            // to the core that started the tile
+            // PARTIAL REMOTE-SEND PHASE
+            // This core didn't start the tile, so it needs to send its locally-accumulated partials
+            // to the core that started the tile.
 
             // Wait for partials from compute core.
             cb_wait_front(cb_id_out, onetile);
 
             // Send partials to peer core.
-            // uint32_t l1_read_addr = get_read_ptr(cb_id_out);
-            // uint32_t local_cb_partials_addr = get_write_ptr(cb_id_partials);
-            // uint64_t peer_noc_addr = get_noc_addr(peer_x, peer_y, local_cb_partials_addr);
-            // noc_async_write(l1_read_addr, peer_noc_addr, tile_bytes);
+            uint32_t l1_read_addr = get_read_ptr(cb_id_out);
+            uint32_t local_cb_partials_addr = get_write_ptr(cb_id_partials);
+            uint64_t peer_noc_addr = get_noc_addr(peer_x, peer_y, local_cb_partials_addr);
+            noc_async_write(l1_read_addr, peer_noc_addr, tile_bytes);
             noc_async_write_barrier();
             DPRINT << "Sent partials to peer (" << peer_x << ", " << peer_y << ") for tile " << tile_idx << ENDL();
 
@@ -77,7 +77,7 @@ void kernel_main() {
         } else {
             // This core started the tile
             if (!tile_ended) {
-                // cb_reserve_back(cb_id_partials, onetile);
+                // PARTIALs REMOTE-RECEIVE PHASE
                 // This core started but didn't finish the tile
                 // Wait for peer's semaphore signal.
                 uint32_t sem_addr = get_semaphore(partials_ready_sem);
@@ -87,19 +87,23 @@ void kernel_main() {
                        << my_sem_addr << ENDL();
                 noc_semaphore_wait(sem_ptr, 1);
                 DPRINT << "Writer: After noc_semaphore_wait for tile " << tile_idx << ENDL();
-                // noc_semaphore_set(sem_ptr, 0);
+                noc_semaphore_set(sem_ptr, 0);
 
                 // Partials have arrived from peer core into partials CB, now publish to compute.
                 // DPRINT << "Writer: Before cb_reserve_back(cb_id_partials) for tile " << tile_idx << ENDL();
                 // DPRINT << "Writer: After cb_reserve_back(cb_id_partials) for tile " << tile_idx << ENDL();
+                // Push to compute to accumulate with local partials.
                 cb_push_back(cb_id_partials, onetile);
 
-                // Write out finished tile after compute has finished.
+                // Wait for accumulation to finish.
                 cb_wait_front(cb_id_out, onetile);
+                DPRINT << "Writer: After cb_wait_front(cb_id_out) for tile " << tile_idx << ENDL();
 
+                // Push final tile to DRAM.
                 uint32_t l1_read_addr = get_read_ptr(cb_id_out);
                 noc_async_write_tile(tile_idx, c, l1_read_addr);
                 noc_async_write_barrier();
+                DPRINT << "Writer: Wrote final tile " << tile_idx << " to DRAM." << ENDL();
 
                 cb_pop_front(cb_id_out, onetile);
             } else {
