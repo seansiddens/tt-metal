@@ -689,12 +689,10 @@ int main(int argc, char** argv) {
         // Parse command-line arguments for matrix dimensions (defaults: M=640, N=640, K=640)
         // Optional named arguments:
         //   --num-cores <value> (0 = use all cores)
-        //   --streamk or -s (use StreamK algorithm instead of baseline)
         uint32_t M = 640;          // Number of rows in matrix A (user-defined)
         uint32_t N = 640;          // Number of columns in matrix B (user-defined)
         uint32_t K = 640;          // Inner dimension for multiplication (user-defined)
         uint32_t num_cores = 0;    // Number of cores to use (0 = use all available)
-        bool use_streamk = false;  // Whether to use StreamK algorithm
 
         // Parse positional arguments for M, N, K
         if (argc >= 4) {
@@ -708,8 +706,6 @@ int main(int argc, char** argv) {
             if (std::string(argv[i]) == "--num-cores" && i + 1 < argc) {
                 num_cores = std::stoul(argv[i + 1]);
                 ++i;  // Skip next argument
-            } else if (std::string(argv[i]) == "--streamk" || std::string(argv[i]) == "-s") {
-                use_streamk = true;
             }
         }
 
@@ -756,28 +752,114 @@ int main(int argc, char** argv) {
         src0_vec = tilize_nfaces(src0_vec, M, K);
         src1_vec = tilize_nfaces(src1_vec, K, N);
 
-        /* Calling the MatMul host program. Read in result into a host vector */
-        std::vector<bfloat16> result_vec(dram_buffer_C_size / sizeof(bfloat16));
+        /* Run both StreamK and Baseline for comparison */
+        std::vector<bfloat16> streamk_vec(dram_buffer_C_size / sizeof(bfloat16));
+        std::vector<bfloat16> baseline_vec(dram_buffer_C_size / sizeof(bfloat16));
 
-        if (use_streamk) {
-            fmt::print("\n=== Running StreamK Algorithm ===\n");
-            matmul_streamk(src0_vec, src1_vec, result_vec, M, N, K, mesh_device, num_cores);
-        } else {
-            fmt::print("\n=== Running Baseline Multi-Core Algorithm ===\n");
-            matmul_multi_core(src0_vec, src1_vec, result_vec, M, N, K, mesh_device, num_cores);
+        fmt::print("\n=== Running StreamK Algorithm ===\n");
+        matmul_streamk(src0_vec, src1_vec, streamk_vec, M, N, K, mesh_device, num_cores);
+        streamk_vec = untilize_nfaces(streamk_vec, M, N);
+
+        fmt::print("\n=== Running Baseline Multi-Core for Comparison ===\n");
+        matmul_multi_core(src0_vec, src1_vec, baseline_vec, M, N, K, mesh_device, num_cores);
+        baseline_vec = untilize_nfaces(baseline_vec, M, N);
+
+        fmt::print("\nStreamK output vector size: {}\n", streamk_vec.size());
+        fmt::print("Baseline output vector size: {}\n", baseline_vec.size());
+
+        // Detailed error analysis
+        fmt::print("\n=== Validation Results ===\n");
+
+        // 1. StreamK vs Baseline
+        float pcc_baseline = check_bfloat16_vector_pcc(baseline_vec, streamk_vec);
+        fmt::print("StreamK vs Baseline -- PCC = {:.8f}\n", pcc_baseline);
+
+        // 2. StreamK vs Golden (for reference)
+        float pcc_golden = check_bfloat16_vector_pcc(golden_vec, streamk_vec);
+        fmt::print("StreamK vs Golden   -- PCC = {:.8f}\n", pcc_golden);
+
+        // 3. Baseline vs Golden (sanity check)
+        float pcc_baseline_golden = check_bfloat16_vector_pcc(golden_vec, baseline_vec);
+        fmt::print("Baseline vs Golden  -- PCC = {:.8f}\n", pcc_baseline_golden);
+
+        // 4. Element-wise error statistics (StreamK vs Baseline)
+        double max_abs_error = 0.0;
+        double sum_abs_error = 0.0;
+        uint32_t num_mismatches = 0;
+
+        for (size_t i = 0; i < streamk_vec.size(); ++i) {
+            float baseline_val = static_cast<float>(baseline_vec[i]);
+            float streamk_val = static_cast<float>(streamk_vec[i]);
+            float abs_error = std::abs(baseline_val - streamk_val);
+            sum_abs_error += abs_error;
+            max_abs_error = std::max(max_abs_error, static_cast<double>(abs_error));
+
+            // Count exact mismatches (bfloat16 comparison)
+            if (baseline_vec[i] != streamk_vec[i]) {
+                num_mismatches++;
+            }
         }
 
-        // Reverse the tilization to get the result in the row-major format that the CPU expects
-        result_vec = untilize_nfaces(result_vec, M, N);
+        double mean_abs_error = sum_abs_error / streamk_vec.size();
+        fmt::print("\nError Statistics (StreamK vs Baseline):\n");
+        fmt::print("  Max absolute error:  {:.6f}\n", max_abs_error);
+        fmt::print("  Mean absolute error: {:.6f}\n", mean_abs_error);
+        fmt::print(
+            "  Exact mismatches:    {} / {} ({:.2f}%)\n",
+            num_mismatches,
+            streamk_vec.size(),
+            100.0 * num_mismatches / streamk_vec.size());
 
-        fmt::print("Output vector of size {}\n", result_vec.size());
+        // 5. Per-tile error analysis (for small matrices)
+        if (Mt * Nt <= 16) {
+            fmt::print("\nPer-Tile Error Analysis (StreamK vs Baseline):\n");
+            for (uint32_t tile_idx = 0; tile_idx < Mt * Nt; ++tile_idx) {
+                uint32_t tile_m = tile_idx / Nt;
+                uint32_t tile_n = tile_idx % Nt;
 
-        // Calculate the Pearson correlation coefficient (PCC) between the golden vector and the result vector
-        // This is a measure of how similar the two vectors are.
-        // A PCC close to 1 indicates that the two vectors are very similar.
-        float pearson = check_bfloat16_vector_pcc(golden_vec, result_vec);
-        fmt::print("Metalium vs Golden -- PCC = {}\n", pearson);
-        TT_FATAL(pearson > 0.97, "PCC not high enough. Result PCC: {}, Expected PCC: 0.97", pearson);
+                double tile_max_error = 0.0;
+                double tile_sum_error = 0.0;
+                uint32_t tile_mismatches = 0;
+
+                for (uint32_t row = 0; row < TILE_HEIGHT; ++row) {
+                    for (uint32_t col = 0; col < TILE_WIDTH; ++col) {
+                        uint32_t global_row = tile_m * TILE_HEIGHT + row;
+                        uint32_t global_col = tile_n * TILE_WIDTH + col;
+                        uint32_t idx = global_row * N + global_col;
+
+                        float baseline_val = static_cast<float>(baseline_vec[idx]);
+                        float streamk_val = static_cast<float>(streamk_vec[idx]);
+                        float abs_error = std::abs(baseline_val - streamk_val);
+                        tile_sum_error += abs_error;
+                        tile_max_error = std::max(tile_max_error, static_cast<double>(abs_error));
+
+                        if (baseline_vec[idx] != streamk_vec[idx]) {
+                            tile_mismatches++;
+                        }
+                    }
+                }
+
+                double tile_mean_error = tile_sum_error / TILE_HW;
+                fmt::print(
+                    "  Tile {:2d} (M={}, N={}): max_err={:.6f}, mean_err={:.6f}, mismatches={}\n",
+                    tile_idx,
+                    tile_m,
+                    tile_n,
+                    tile_max_error,
+                    tile_mean_error,
+                    tile_mismatches);
+            }
+        }
+
+        // Validation: StreamK should match baseline very closely
+        constexpr float required_pcc = 0.99;  // StreamK should match baseline almost perfectly
+        fmt::print("\nValidation: ");
+        if (pcc_baseline >= required_pcc) {
+            fmt::print("PASSED (PCC >= {})\n", required_pcc);
+        } else {
+            fmt::print("FAILED (PCC < {})\n", required_pcc);
+            TT_FATAL(false, "StreamK vs Baseline PCC too low: {:.8f} < {}", pcc_baseline, required_pcc);
+        }
 
         pass &= mesh_device->close();
 

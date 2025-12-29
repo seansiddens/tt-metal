@@ -58,6 +58,15 @@ void kernel_main() {
             // Send partials to peer core.
             uint32_t l1_read_addr = get_read_ptr(cb_id_out);
             uint32_t local_cb_partials_addr = get_write_ptr(cb_id_partials);
+
+            // DEBUG: Print first few values of the partial tile we're sending
+            volatile tt_l1_ptr uint16_t* partial_data = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(l1_read_addr);
+            DPRINT << "SENDER tile " << tile_idx << ": cb_out addr=0x" << (uint32_t)l1_read_addr
+                   << " cb_partials_wr_ptr=0x" << local_cb_partials_addr << ENDL();
+            DPRINT << "SENDER tile " << tile_idx << " data[0:7]= " << partial_data[0] << " " << partial_data[1] << " "
+                   << partial_data[2] << " " << partial_data[3] << " " << partial_data[4] << " " << partial_data[5]
+                   << " " << partial_data[6] << " " << partial_data[7] << ENDL();
+
             uint64_t peer_noc_addr = get_noc_addr(peer_x, peer_y, local_cb_partials_addr);
             noc_async_write(l1_read_addr, peer_noc_addr, tile_bytes);
             noc_async_write_barrier();
@@ -70,7 +79,7 @@ void kernel_main() {
             // noc_semaphore_set_remote(reinterpret_cast<uint32_t>(&val), peer_sem_noc);
             noc_semaphore_inc(peer_sem_noc, 1);
             DPRINT << "Signaled peer (" << peer_x << ", " << peer_y << ") for tile " << tile_idx
-                   << "on semaphore addr: << " << peer_sem_noc << ENDL();
+                   << " on semaphore addr: 0x" << (uint32_t)peer_sem_noc << ENDL();
             noc_async_atomic_barrier();
 
             cb_pop_front(cb_id_out, onetile);
@@ -83,11 +92,22 @@ void kernel_main() {
                 uint32_t sem_addr = get_semaphore(partials_ready_sem);
                 volatile tt_l1_ptr uint32_t* sem_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sem_addr);
                 uint64_t my_sem_addr = get_noc_addr(my_x, my_y, sem_addr);
-                DPRINT << "Writer: Before noc_semaphore_wait for tile " << tile_idx << "on semaphore addr: << "
-                       << my_sem_addr << ENDL();
+
+                uint32_t partials_read_addr = get_read_ptr(cb_id_partials);
+                DPRINT << "REDUCER tile " << tile_idx << ": Before sem_wait, cb_partials rd_ptr=0x"
+                       << partials_read_addr << " sem_addr=0x" << (uint32_t)my_sem_addr << ENDL();
+
                 noc_semaphore_wait(sem_ptr, 1);
-                DPRINT << "Writer: After noc_semaphore_wait for tile " << tile_idx << ENDL();
+                DPRINT << "REDUCER tile " << tile_idx << ": After sem_wait" << ENDL();
                 noc_semaphore_set(sem_ptr, 0);
+
+                // DEBUG: Check what data arrived in cb_partials
+                volatile tt_l1_ptr uint16_t* received_data =
+                    reinterpret_cast<volatile tt_l1_ptr uint16_t*>(partials_read_addr);
+                DPRINT << "REDUCER tile " << tile_idx << " received data[0:7]= " << received_data[0] << " "
+                       << received_data[1] << " " << received_data[2] << " " << received_data[3] << " "
+                       << received_data[4] << " " << received_data[5] << " " << received_data[6] << " "
+                       << received_data[7] << ENDL();
 
                 // Partials have arrived from peer core into partials CB, now publish to compute.
                 // DPRINT << "Writer: Before cb_reserve_back(cb_id_partials) for tile " << tile_idx << ENDL();

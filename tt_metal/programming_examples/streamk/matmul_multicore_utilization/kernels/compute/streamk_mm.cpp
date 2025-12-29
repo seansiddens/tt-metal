@@ -123,8 +123,6 @@ void MAIN {
                 // PARTIALs REMOTE-RECEIVE PHASE
                 // accumulate partial sums from other cores contributing to this tile
                 // This core started but didn't finish the tile, so wait for partials from later cores
-                binary_op_init_common(cb_id_partials, cb_out, cb_out);
-                // add_tiles_init(cb_id_partials, cb_out);
 
                 // Wait for partials to arrive from other cores.
                 DPRINT_PACK(DPRINT << "Compute: Before cb_wait_front(cb_id_partials) for tile " << tile_idx << ENDL());
@@ -133,13 +131,16 @@ void MAIN {
 
                 // pack_tile(dst_reg, cb_out);
 
-                // // Print full PARTIALS tile contents (packer RISC with wr_ptr)
-                // DPRINT_PACK(DPRINT << "===== PARTIALS TILE " << tile_idx << " =====" << ENDL());
-                // for (uint8_t r = 0; r < 32; ++r) {
-                //     SliceRange sr = SliceRange{.h0 = r, .h1 = static_cast<uint8_t>(r + 1), .hs = 1, .w0 = 0, .w1 =
-                //     32, .ws = 1}; DPRINT_PACK({ DPRINT << "Partials Row " << (uint)r << ": " <<
-                //     TileSlice(cb_id_partials, 0, sr, true, false) << ENDL(); });
-                // }
+                // Print PARTIALS tile contents (first 2 rows, 8 cols for brevity)
+                DPRINT_PACK(DPRINT << "===== PARTIALS TILE " << tile_idx << " (from sender) =====" << ENDL());
+                for (uint8_t r = 0; r < 2; ++r) {
+                    SliceRange sr =
+                        SliceRange{.h0 = r, .h1 = static_cast<uint8_t>(r + 1), .hs = 1, .w0 = 0, .w1 = 8, .ws = 1};
+                    DPRINT_PACK({
+                        DPRINT << "Partials Row " << (uint)r << ": " << TileSlice(cb_id_partials, 0, sr, true, false)
+                               << ENDL();
+                    });
+                }
 
                 // // Print full OUT tile contents BEFORE add (it should have accumulated data from this core's MACs)
                 // DPRINT_PACK(DPRINT << "===== OUT TILE " << tile_idx << " BEFORE ADD =====" << ENDL());
@@ -153,7 +154,8 @@ void MAIN {
                 // tile_regs_acquire();
                 // add_tiles(cb_id_partials, cb_out, 0, 0, dst_reg);
 
-                tile_regs_acquire();
+                // dst_reg still holds the accumulator from the MAC loop above (lines 87-99)
+                // Do NOT call tile_regs_acquire() again - that would clear the accumulator!
                 binary_dest_reuse_tiles_init<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_id_partials);
                 binary_dest_reuse_tiles<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_id_partials, 0, dst_reg);
 
@@ -166,13 +168,15 @@ void MAIN {
                 DPRINT_PACK(DPRINT << "Compute: After cb_reserve_back(cb_out) for tile " << tile_idx << ENDL());
                 pack_tile(dst_reg, cb_out);
 
-                // // Print full OUT tile contents AFTER pack to CB
-                // DPRINT_PACK(DPRINT << "===== OUT TILE " << tile_idx << " AFTER ADD AND PACK =====" << ENDL());
-                // for (uint8_t r = 0; r < 32; ++r) {
-                //     SliceRange sr = SliceRange{.h0 = r, .h1 = static_cast<uint8_t>(r + 1), .hs = 1, .w0 = 0, .w1 =
-                //     32, .ws = 1}; DPRINT_PACK({ DPRINT << "OutAfter Row " << (uint)r << ": " << TileSlice(cb_out, 0,
-                //     sr, true, false) << ENDL(); });
-                // }
+                // Print final OUT tile contents AFTER adding partials (first 2 rows, 8 cols)
+                DPRINT_PACK(DPRINT << "===== OUT TILE " << tile_idx << " AFTER ADD AND PACK =====" << ENDL());
+                for (uint8_t r = 0; r < 2; ++r) {
+                    SliceRange sr =
+                        SliceRange{.h0 = r, .h1 = static_cast<uint8_t>(r + 1), .hs = 1, .w0 = 0, .w1 = 8, .ws = 1};
+                    DPRINT_PACK({
+                        DPRINT << "OutAfter Row " << (uint)r << ": " << TileSlice(cb_out, 0, sr, true, false) << ENDL();
+                    });
+                }
 
                 cb_push_back(cb_out, 1);
                 // DPRINT_PACK(DPRINT << "Compute: After cb_push_back(cb_out) for tile " << tile_idx << ENDL());
