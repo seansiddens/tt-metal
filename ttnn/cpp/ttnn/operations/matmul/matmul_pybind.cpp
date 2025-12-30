@@ -396,6 +396,24 @@ void py_module(py::module& module) {
         This program config is a specialized config for very narrow tensors stored in DRAM.
     )doc");
 
+    auto matmul_streamk_program_config =
+        tt_serializable_class<MatmulStreamKProgramConfig>(module, "MatmulStreamKProgramConfig", R"doc(
+        Configuration class for StreamK matmul operations.
+
+        StreamK is a load-balancing algorithm that distributes work by MAC (multiply-accumulate)
+        iterations rather than output tiles. This enables partial tile computation across cores
+        and can provide better performance for matrices with small M/N dimensions but large K.
+    )doc");
+
+    matmul_streamk_program_config.def(py::init<CoreCoord>(), py::kw_only(), py::arg("compute_with_storage_grid_size"));
+    matmul_streamk_program_config.def_readwrite(
+        "compute_with_storage_grid_size", &MatmulStreamKProgramConfig::compute_with_storage_grid_size, R"doc(
+        Grid size for compute cores with storage capability.
+
+        Specifies the 2D grid of cores (x, y) that will be used for StreamK computation.
+        Work is distributed evenly across all cores based on total MAC iterations.
+    )doc");
+
     matmul_multi_core_reuse_multicast_dram_sharded_program_config
         .def(
             py::init<std::size_t, std::size_t, std::size_t, std::optional<UnaryWithParam>>(),

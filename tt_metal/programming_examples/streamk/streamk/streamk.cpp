@@ -205,14 +205,14 @@ void matmul_multi_core(
     // - Writer kernel: Handles writing output data from circular buffers back to DRAM
     // - Compute kernel: Performs the actual matrix multiplication computation
     // All kernels run across all cores to enable parallel execution
-    MathFidelity math_fidelity = MathFidelity::HiFi4;  // High fidelity math for accurate results
+    // MathFidelity math_fidelity = MathFidelity::HiFi4;  // High fidelity math for accurate results
+    MathFidelity math_fidelity = MathFidelity::LoFi;  // High fidelity math for accurate results
     std::vector<uint32_t> reader_compile_time_args;
     TensorAccessorArgs(*src0_dram_buffer).append_to(reader_compile_time_args);
     TensorAccessorArgs(*src1_dram_buffer).append_to(reader_compile_time_args);
     auto reader_id = tt_metal::CreateKernel(
         program,
-        OVERRIDE_KERNEL_PREFIX
-        "streamk/matmul_multicore_utilization/kernels/dataflow/reader_mm_output_tiles_partitioned.cpp",
+        OVERRIDE_KERNEL_PREFIX "streamk/streamk/kernels/dataflow/reader_mm_output_tiles_partitioned.cpp",
         all_cores,
         tt_metal::DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_1,
@@ -223,8 +223,7 @@ void matmul_multi_core(
     TensorAccessorArgs(*dst_dram_buffer).append_to(writer_compile_time_args);
     auto writer_id = tt_metal::CreateKernel(
         program,
-        OVERRIDE_KERNEL_PREFIX
-        "streamk/matmul_multicore_utilization/kernels/dataflow/writer_unary_interleaved_start_id.cpp",
+        OVERRIDE_KERNEL_PREFIX "streamk/streamk/kernels/dataflow/writer_unary_interleaved_start_id.cpp",
         all_cores,
         tt_metal::DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_0,
@@ -233,7 +232,7 @@ void matmul_multi_core(
 
     auto compute_kernel_id = tt_metal::CreateKernel(
         program,
-        OVERRIDE_KERNEL_PREFIX "streamk/matmul_multicore_utilization/kernels/compute/mm.cpp",
+        OVERRIDE_KERNEL_PREFIX "streamk/streamk/kernels/compute/mm.cpp",
         all_cores,
         tt_metal::ComputeConfig{.math_fidelity = math_fidelity, .compile_args = {}});
 
@@ -460,7 +459,7 @@ void matmul_streamk(
     TensorAccessorArgs(*src1_dram_buffer).append_to(reader_compile_time_args);
     auto reader_id = tt_metal::CreateKernel(
         program,
-        OVERRIDE_KERNEL_PREFIX "streamk/matmul_multicore_utilization/kernels/dataflow/streamk_reader.cpp",
+        OVERRIDE_KERNEL_PREFIX "streamk/streamk/kernels/dataflow/streamk_reader.cpp",
         all_cores,
         tt_metal::DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_1,
@@ -471,7 +470,7 @@ void matmul_streamk(
     TensorAccessorArgs(*dst_dram_buffer).append_to(writer_compile_time_args);
     auto writer_id = tt_metal::CreateKernel(
         program,
-        OVERRIDE_KERNEL_PREFIX "streamk/matmul_multicore_utilization/kernels/dataflow/streamk_writer.cpp",
+        OVERRIDE_KERNEL_PREFIX "streamk/streamk/kernels/dataflow/streamk_writer.cpp",
         all_cores,
         tt_metal::DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_0,
@@ -480,7 +479,7 @@ void matmul_streamk(
 
     auto compute_kernel_id = tt_metal::CreateKernel(
         program,
-        OVERRIDE_KERNEL_PREFIX "streamk/matmul_multicore_utilization/kernels/compute/streamk_mm.cpp",
+        OVERRIDE_KERNEL_PREFIX "streamk/streamk/kernels/compute/streamk_mm.cpp",
         all_cores,
         tt_metal::ComputeConfig{.math_fidelity = math_fidelity, .compile_args = {}});
 
@@ -667,26 +666,47 @@ void matmul_streamk(
     distributed::EnqueueWriteMeshBuffer(cq, src1_dram_buffer, b, false);
     workload.add_program(device_range, std::move(program));
 
-    // Time the kernel execution (same as baseline)
-    auto start_time = std::chrono::high_resolution_clock::now();
-    distributed::EnqueueMeshWorkload(cq, workload, true);
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    // Warmup iterations (not recorded)
+    constexpr uint32_t warmup_iterations = 10;
+    fmt::print("Running {} warmup iterations...\n", warmup_iterations);
+    for (uint32_t iter = 0; iter < warmup_iterations; ++iter) {
+        distributed::EnqueueMeshWorkload(cq, workload, true);
+    }
+
+    // Benchmark iterations with timing
+    constexpr uint32_t bench_iterations = 10;
+    std::vector<int64_t> execution_times;
+    execution_times.reserve(bench_iterations);
+
+    fmt::print("Running {} benchmark iterations...\n", bench_iterations);
+    for (uint32_t iter = 0; iter < bench_iterations; ++iter) {
+        auto start_time = std::chrono::high_resolution_clock::now();
+        distributed::EnqueueMeshWorkload(cq, workload, true);
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        execution_times.push_back(elapsed_us);
+    }
+
+    // Print individual times and calculate average
+    fmt::print("\nExecution times:\n");
+    int64_t total_us = 0;
+    for (size_t i = 0; i < execution_times.size(); ++i) {
+        fmt::print("  Iteration {}: {} us ({:.3f} ms)\n", i, execution_times[i], execution_times[i] / 1000.0);
+        total_us += execution_times[i];
+    }
+    double avg_us = static_cast<double>(total_us) / execution_times.size();
+    fmt::print("Average execution time: {:.2f} us ({:.3f} ms)\n", avg_us, avg_us / 1000.0);
+
+    // Calculate and print TFLOPs
+    double flops = 2.0 * M * N * K;  // multiply-add
+    double time_s = avg_us / 1e6;
+    double tflops = flops / (time_s * 1e12);
+    fmt::print("Average throughput:     {:.3f} TFLOPs\n\n", tflops);
 
     // Read back the result from DRAM to host memory
     distributed::EnqueueReadMeshBuffer(cq, output, dst_dram_buffer, true);
 
     fmt::print("Execution complete!\n");
-
-    // Calculate and print performance metrics
-    double time_ms = elapsed_us / 1000.0;
-    double flops = 2.0 * M * N * K;  // multiply-add
-    double time_s = elapsed_us / 1e6;
-    double tflops = flops / (time_s * 1e12);
-
-    fmt::print("\nStreamK Performance:\n");
-    fmt::print("  Kernel execution time: {} us ({:.3f} ms)\n", elapsed_us, time_ms);
-    fmt::print("  Throughput:            {:.3f} TFLOPs\n", tflops);
 
     fmt::print("\nMatmul StreamK Complete ======================\n");
 }
@@ -703,10 +723,10 @@ int main(int argc, char** argv) {
         // Parse command-line arguments for matrix dimensions (defaults: M=640, N=640, K=640)
         // Optional named arguments:
         //   --num-cores <value> (0 = use all cores)
-        uint32_t M = 640;          // Number of rows in matrix A (user-defined)
-        uint32_t N = 640;          // Number of columns in matrix B (user-defined)
-        uint32_t K = 640;          // Inner dimension for multiplication (user-defined)
-        uint32_t num_cores = 0;    // Number of cores to use (0 = use all available)
+        uint32_t M = 640;        // Number of rows in matrix A (user-defined)
+        uint32_t N = 640;        // Number of columns in matrix B (user-defined)
+        uint32_t K = 640;        // Inner dimension for multiplication (user-defined)
+        uint32_t num_cores = 0;  // Number of cores to use (0 = use all available)
 
         // Parse positional arguments for M, N, K
         if (argc >= 4) {

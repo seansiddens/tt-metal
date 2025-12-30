@@ -30,6 +30,7 @@ target_sources(
         device/matmul_op_multi_core_reuse_mcast_dram_sharded_program_factory.cpp
         device/matmul_op_multi_core_reuse_optimized_program_factory.cpp
         device/matmul_op_multi_core_reuse_program_factory.cpp
+        device/matmul_op_streamk_program_factory.cpp
         matmul.cpp
 )
 

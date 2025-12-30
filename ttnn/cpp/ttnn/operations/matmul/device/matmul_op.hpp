@@ -224,6 +224,10 @@ struct MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig {
     std::optional<UnaryWithParam> fused_activation;
 };
 
+struct MatmulStreamKProgramConfig {
+    CoreCoord compute_with_storage_grid_size;
+};
+
 struct MatmulMultiCoreProgramConfig {};
 
 using MatmulProgramConfig = std::variant<
@@ -231,7 +235,8 @@ using MatmulProgramConfig = std::variant<
     MatmulMultiCoreReuseProgramConfig,
     MatmulMultiCoreReuseMultiCastProgramConfig,
     MatmulMultiCoreReuseMultiCast1DProgramConfig,
-    MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>;
+    MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig,
+    MatmulStreamKProgramConfig>;
 
 struct Matmul {
     const std::optional<const MatmulProgramConfig> program_config = std::nullopt;

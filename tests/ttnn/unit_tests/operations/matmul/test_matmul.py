@@ -2552,3 +2552,61 @@ def test_matmul_block_sharded_input_with_padding(device):
 
     output = ttnn.to_torch(ttnn_output)
     assert_with_pcc(torch_output, output, pcc=0.99)
+
+
+@pytest.mark.parametrize("m,k,n", [(128, 2048, 128), (64, 1024, 64), (256, 4096, 256)])
+def test_streamk_matmul(device, m, k, n):
+    """
+    Test StreamK matmul implementation.
+
+    StreamK is designed for load balancing when output tiles < number of cores.
+    This test uses small M/N with large K, which is the ideal scenario for StreamK.
+    """
+    torch.manual_seed(0)
+
+    # Create input tensors
+    torch_input_a = torch.randn((1, 1, m, k), dtype=torch.bfloat16)
+    torch_input_b = torch.randn((1, 1, k, n), dtype=torch.bfloat16)
+    torch_output = torch.matmul(torch_input_a, torch_input_b)
+
+    # Convert to TTNN tensors
+    ttnn_input_a = ttnn.from_torch(
+        torch_input_a,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        dtype=ttnn.bfloat16,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+
+    ttnn_input_b = ttnn.from_torch(
+        torch_input_b,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        dtype=ttnn.bfloat16,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+
+    # Get device grid size
+    grid_size = device.compute_with_storage_grid_size()
+
+    # Create StreamK program config
+    streamk_config = ttnn.MatmulStreamKProgramConfig(compute_with_storage_grid_size=grid_size)
+
+    # Create compute kernel config
+    compute_kernel_config = ttnn.init_device_compute_kernel_config(
+        device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+    )
+
+    # Run matmul with StreamK
+    ttnn_output = ttnn.matmul(
+        ttnn_input_a,
+        ttnn_input_b,
+        program_config=streamk_config,
+        dtype=ttnn.bfloat16,
+        compute_kernel_config=compute_kernel_config,
+    )
+
+    # Validate output
+    output = ttnn.to_torch(ttnn_output)
+    assert_with_pcc(torch_output, output, pcc=0.99)

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ttnn/operations/matmul/device/matmul_op.hpp"
+#include "ttnn/operations/matmul/device/matmul_op_streamk_program_factory.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1186,7 +1187,8 @@ inline MatmulProgramConfig get_program_config(
             using ProgramConfigType = std::decay_t<decltype(program_config)>;
             if constexpr (
                 not std::is_same_v<ProgramConfigType, MatmulMultiCoreProgramConfig> and
-                not std::is_same_v<ProgramConfigType, MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>) {
+                not std::is_same_v<ProgramConfigType, MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig> and
+                not std::is_same_v<ProgramConfigType, MatmulStreamKProgramConfig>) {
                 TT_FATAL(
                     program_config.compute_with_storage_grid_size.x <=
                         input_tensor_a.device()->compute_with_storage_grid_size().x,
@@ -2762,6 +2764,11 @@ operation::CacheableMeshWorkload<std::vector<Tensor>> Matmul::create_mesh_worklo
                 auto multicore_mm_program =
                     matmul_multi_core(input_tensor_a, input_tensor_b, output_tensor, broadcast_batch);
                 return create_homogenous_mesh_workload(multicore_mm_program, tensor_coords);
+            } else if constexpr (std::is_same_v<ProgramConfigType, MatmulStreamKProgramConfig>) {
+                TT_FATAL(!bias.has_value(), "Bias is not supported for StreamK matmul");
+                auto streamk_mm_program = matmul_streamk(
+                    input_tensor_a, input_tensor_b, output_tensor, program_config, this->compute_kernel_config.value());
+                return create_homogenous_mesh_workload(streamk_mm_program, tensor_coords);
             } else {
                 TT_THROW("Unrecognized Config");
             }
