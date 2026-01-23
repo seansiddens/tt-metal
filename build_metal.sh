@@ -51,6 +51,7 @@ show_help() {
     echo "  --without-distributed            Disable distributed compute support (OpenMPI dependency). Enabled by default."
     echo "  --without-python-bindings        Disable Python bindings (ttnncpp will be available as standalone library, otherwise ttnn will include the cpp backend and the python bindings), Enabled by default"
     echo "  --enable-fake-kernels-target     Enable fake kernels target, to enable generation of compile_commands.json for the kernels to enable IDE support."
+    echo "  --allow-unused-vars              Disable unused variable warnings/errors."
 }
 
 clean() {
@@ -97,6 +98,7 @@ configure_only="OFF"
 enable_distributed="ON"
 with_python_bindings="ON"
 enable_fake_kernels_target="OFF"
+allow_unused_vars="OFF"
 
 declare -a cmake_args
 
@@ -136,6 +138,7 @@ configure-only
 without-distributed
 without-python-bindings
 enable-fake-kernels-target
+allow-unused-vars
 "
 
 # Flatten LONGOPTIONS into a comma-separated string for getopt
@@ -199,6 +202,8 @@ while true; do
             with_python_bindings="OFF";;
         --enable-fake-kernels-target)
             enable_fake_kernels_target="ON";;
+        --allow-unused-vars)
+            allow_unused_vars="ON";;
         --disable-unity-builds)
 	    unity_builds="OFF";;
         --disable-light-metal-trace)
@@ -404,6 +409,11 @@ if [ "$enable_fake_kernels_target" = "ON" ]; then
     cmake_args+=("-DENABLE_FAKE_KERNELS_TARGET=ON")
 else
     cmake_args+=("-DENABLE_FAKE_KERNELS_TARGET=OFF")
+fi
+
+if [ "$allow_unused_vars" = "ON" ]; then
+    cmake_args+=("-DCMAKE_CXX_FLAGS=-Wno-error=unused-variable -Wno-error=unused-parameter")
+    cmake_args+=("-DCMAKE_C_FLAGS=-Wno-error=unused-variable -Wno-error=unused-parameter")
 fi
 
 # toolchain and cxx_compiler settings would conflict with eachother

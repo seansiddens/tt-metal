@@ -232,7 +232,7 @@ tt::tt_metal::operation::ProgramWithCallbacks matmul_streamk(
     // ========================================================================
     // OVERRIDE RUNTIME ARGUMENTS CALLBACK
     // ========================================================================
-    auto override_runtime_args_callback = [reader_id, compute_kernel_id, writer_id, num_cores, grid_size](
+    auto override_runtime_args_callback = [reader_id, compute_kernel_id, writer_id, all_cores](
                                               const void* operation,
                                               const Program& program,
                                               const std::vector<Tensor>& input_tensors,
@@ -242,7 +242,7 @@ tt::tt_metal::operation::ProgramWithCallbacks matmul_streamk(
         auto src1_buffer = input_tensors.at(1).buffer();
         auto dst_buffer = output_tensors.at(0).buffer();
 
-        for (const auto& core_range : num_cores_to_corerangeset(num_cores, grid_size, true).ranges()) {
+        for (const auto& core_range : all_cores.ranges()) {
             for (const auto& core : core_range) {
                 // Update reader args (buffer addresses)
                 {
