@@ -391,6 +391,22 @@ void matmul_streamk(
     const uint32_t Nt = N / TILE_WIDTH;   // Number of tiles in N dimension
     fmt::print(" Mt: {}, Nt: {}, Kt: {}\n", Mt, Nt, Kt);
 
+    // Compute StreamK work distribution parameters early (needed for CB sizing)
+    uint32_t macs_per_tile = Kt;  // MAC iters (A_mk * B_kn) per output tile C_mn
+    uint32_t total_macs = Mt * Nt * macs_per_tile;
+    uint32_t macs_per_core = ceil_div(total_macs, target_num_cores);
+
+    // Max contributors per tile: a tile can span at most ceil(macs_per_tile / macs_per_core) + 1 cores
+    uint32_t max_contributors = std::min(target_num_cores, ceil_div(macs_per_tile, macs_per_core) + 1);
+    // Ensure at least 1 for edge cases
+    max_contributors = std::max(1u, max_contributors);
+    fmt::print(
+        "StreamK: macs_per_tile={}, total_macs={}, macs_per_core={}, max_contributors={}\n",
+        macs_per_tile,
+        total_macs,
+        macs_per_core,
+        max_contributors);
+
     // Create DRAM buffers for input and output matrices (replicated per device across the mesh).
     // We allocate DRAM buffers for the input matrices and output matrix.
     // Setting page_size to single_tile_size is the most common configuration for memory buffers in Metalium
@@ -438,11 +454,13 @@ void matmul_streamk(
         CircularBufferConfig(num_input_tiles * single_tile_size, {{CBIndex::c_16, cb_data_format}})
             .set_page_size(CBIndex::c_16, single_tile_size));
 
-    // Partials CB: used to exchange partial tiles between paired cores
+    // Partials CB: used to exchange partial tiles between cores
+    // Sized to hold max_contributors tiles to support N-way tile splits
+    uint32_t partials_cb_tiles = std::max(2u, max_contributors);
     tt_metal::CreateCircularBuffer(
         program,
         all_cores,  // create on all cores
-        CircularBufferConfig(num_input_tiles * single_tile_size, {{CBIndex::c_2, cb_data_format}})
+        CircularBufferConfig(partials_cb_tiles * single_tile_size, {{CBIndex::c_2, cb_data_format}})
             .set_page_size(CBIndex::c_2, single_tile_size));
 
     // Semaphore: per-core synchronization for partials handling
@@ -453,7 +471,7 @@ void matmul_streamk(
     // - Writer kernel: Handles writing output data from circular buffers back to DRAM
     // - Compute kernel: Performs the actual matrix multiplication computation
     // All kernels run across all cores to enable parallel execution
-    MathFidelity math_fidelity = MathFidelity::HiFi4;  // High fidelity math for accurate results
+    MathFidelity math_fidelity = MathFidelity::LoFi;  // Match baseline for fair comparison
     std::vector<uint32_t> reader_compile_time_args;
     TensorAccessorArgs(*src0_dram_buffer).append_to(reader_compile_time_args);
     TensorAccessorArgs(*src1_dram_buffer).append_to(reader_compile_time_args);
@@ -489,98 +507,132 @@ void matmul_streamk(
     // without recompilation.
     fmt::print("\nWork distribution across cores:\n");
 
-    // Validation: ensure each output tile is touched by at most two cores.
-    std::vector<uint32_t> tile_core_touch_counts(num_output_tiles_total, 0);
+    // Track which cores touch each tile and compute per-tile metadata for general N-way splits
+    std::vector<uint32_t> tile_num_contributors(num_output_tiles_total, 0);
+    std::vector<uint32_t> tile_starter_core_idx(num_output_tiles_total, UINT32_MAX);
+    std::vector<CoreCoord> tile_starter_physical(num_output_tiles_total);
 
-    // StreamK work distribution.
-    uint32_t macs_per_tile = ceil_div(K, TILE_WIDTH);  // MAC iters (A_mk * B_kn) per outut tile C_mn
-    uint32_t total_macs = ceil_div(M, TILE_HEIGHT) * ceil_div(N, TILE_WIDTH) * macs_per_tile;
-    uint32_t macs_per_core = ceil_div(total_macs, target_num_cores);  // # of MACs each core is responsible for.
-
+    // (macs_per_tile, total_macs, macs_per_core already computed above for CB sizing)
     fmt::print("MACs per tile: {}\n", macs_per_tile);
     fmt::print("Total MACs: {}\n", total_macs);
     fmt::print("MACs per core: {}\n", macs_per_core);
 
+    // First pass: collect core physical coordinates and compute per-tile metadata
+    std::vector<CoreCoord> core_physical_coords;
+    std::vector<uint32_t> core_mac_starts;
+    std::vector<uint32_t> core_mac_ends;
+
     uint32_t core_idx = 0;
-    CoreCoord prev_core_logical = CoreCoord{0, 0};
-    CoreCoord prev_core_physical = CoreCoord{0, 0};
     for (const auto& range : all_cores.ranges()) {
         for (const auto& core : range) {
-            // Convert logical coordinates to physical coordinates for NoC addressing
             CoreCoord core_physical = mesh_device->worker_core_from_logical_core(core);
-            uint32_t my_x = core_physical.x;
-            uint32_t my_y = core_physical.y;
-            uint32_t peer_x = (core_idx == 0) ? core_physical.x : prev_core_physical.x;
-            uint32_t peer_y = (core_idx == 0) ? core_physical.y : prev_core_physical.y;
-
-            fmt::print(
-                "Core {} logical ({}, {}), physical ({}, {}), Peer physical: ({}, {})\n",
-                core_idx,
-                core.x,
-                core.y,
-                core_physical.x,
-                core_physical.y,
-                peer_x,
-                peer_y);
+            core_physical_coords.push_back(core_physical);
 
             uint32_t mac_start = core_idx * macs_per_core;
             uint32_t mac_end = std::min(mac_start + macs_per_core, total_macs);
-            fmt::print("  MAC range: [{}, {})\n", mac_start, mac_end);
+            core_mac_starts.push_back(mac_start);
+            core_mac_ends.push_back(mac_end);
 
             // Determine which output tiles this core works on
             uint32_t first_tile = mac_start / macs_per_tile;
-            uint32_t last_tile = (mac_end - 1) / macs_per_tile;
+            uint32_t last_tile = (mac_end > 0) ? (mac_end - 1) / macs_per_tile : first_tile;
 
-            fmt::print(
-                "  Output tiles touched: {} to {} (count: {})\n", first_tile, last_tile, last_tile - first_tile + 1);
-
-            // For each tile, check if this core does first/last MAC iteration
+            // For each tile, track contributors and identify starter
             for (uint32_t tile_idx = first_tile; tile_idx <= last_tile; ++tile_idx) {
                 uint32_t tile_mac_start = tile_idx * macs_per_tile;
                 uint32_t tile_mac_end = tile_mac_start + macs_per_tile;
 
-                // Compute this core's MAC range for this specific tile
                 uint32_t core_tile_mac_start = std::max(mac_start, tile_mac_start);
                 uint32_t core_tile_mac_end = std::min(mac_end, tile_mac_end);
 
-                // Check if this core does the first or last MAC for this tile
+                if (core_tile_mac_end > core_tile_mac_start) {
+                    tile_num_contributors[tile_idx]++;
+
+                    // Check if this core is the starter (first to work on this tile)
+                    bool tile_started = (core_tile_mac_start == tile_mac_start);
+                    if (tile_started) {
+                        tile_starter_core_idx[tile_idx] = core_idx;
+                        tile_starter_physical[tile_idx] = core_physical;
+                    }
+                }
+            }
+            core_idx++;
+        }
+    }
+
+    // Verify max_contributors bound computed earlier
+    uint32_t actual_max_contributors = 1;
+    for (uint32_t t = 0; t < num_output_tiles_total; ++t) {
+        actual_max_contributors = std::max(actual_max_contributors, tile_num_contributors[t]);
+    }
+    fmt::print("Actual max contributors per tile: {} (bound: {})\n", actual_max_contributors, max_contributors);
+    TT_ASSERT(actual_max_contributors <= max_contributors, "max_contributors bound exceeded");
+
+    // Second pass: set runtime args for each core
+    core_idx = 0;
+    CoreCoord prev_core_logical = CoreCoord{0, 0};
+    CoreCoord prev_core_physical = CoreCoord{0, 0};
+    for (const auto& range : all_cores.ranges()) {
+        for (const auto& core : range) {
+            CoreCoord core_physical = core_physical_coords[core_idx];
+            uint32_t my_x = core_physical.x;
+            uint32_t my_y = core_physical.y;
+
+            uint32_t mac_start = core_mac_starts[core_idx];
+            uint32_t mac_end = core_mac_ends[core_idx];
+
+            fmt::print(
+                "Core {} logical ({}, {}), physical ({}, {})\n",
+                core_idx,
+                core.x,
+                core.y,
+                core_physical.x,
+                core_physical.y);
+            fmt::print("  MAC range: [{}, {})\n", mac_start, mac_end);
+
+            // Determine which output tiles this core works on
+            uint32_t first_tile = mac_start / macs_per_tile;
+            uint32_t last_tile = (mac_end > 0) ? (mac_end - 1) / macs_per_tile : first_tile;
+
+            fmt::print(
+                "  Output tiles touched: {} to {} (count: {})\n", first_tile, last_tile, last_tile - first_tile + 1);
+
+            // For each tile, print debug info
+            for (uint32_t tile_idx = first_tile; tile_idx <= last_tile; ++tile_idx) {
+                uint32_t tile_mac_start = tile_idx * macs_per_tile;
+                uint32_t tile_mac_end = tile_mac_start + macs_per_tile;
+
+                uint32_t core_tile_mac_start = std::max(mac_start, tile_mac_start);
+                uint32_t core_tile_mac_end = std::min(mac_end, tile_mac_end);
+
                 bool tile_started = (core_tile_mac_start == tile_mac_start);
                 bool tile_finished = (core_tile_mac_end == tile_mac_end);
 
-                // K-iteration range within this tile
                 uint32_t k_start = core_tile_mac_start - tile_mac_start;
                 uint32_t k_end = core_tile_mac_end - tile_mac_start;
 
                 fmt::print(
-                    "    Tile {}: K-iters [{}, {}), started={}, finished={}\n",
+                    "    Tile {}: K-iters [{}, {}), started={}, finished={}, num_contributors={}\n",
                     tile_idx,
                     k_start,
                     k_end,
                     tile_started,
-                    tile_finished);
-
-                // Count how many distinct cores touch this tile (non-empty K range).
-                if (core_tile_mac_end > core_tile_mac_start) {
-                    uint32_t new_count = ++tile_core_touch_counts[tile_idx];
-                    if (new_count > 2) {
-                        fmt::print(
-                            stderr,
-                            "Error: Output tile {} is touched by more than two cores ({}). Core {} ({}, {}) MAC range "
-                            "[{}, {}) contributes K-iters [{}, {}).\n",
-                            tile_idx,
-                            new_count,
-                            core_idx,
-                            core.x,
-                            core.y,
-                            mac_start,
-                            mac_end,
-                            k_start,
-                            k_end);
-                        TT_FATAL(
-                            false, "StreamK invalid work split: tile {} touched by {} cores (>2)", tile_idx, new_count);
-                    }
-                }
+                    tile_finished,
+                    tile_num_contributors[tile_idx]);
             }
+
+            // Compute first_tile metadata (for non-starter case)
+            uint32_t first_tile_starter_idx = tile_starter_core_idx[first_tile];
+            CoreCoord first_tile_starter = tile_starter_physical[first_tile];
+            bool is_first_tile_starter = (first_tile_starter_idx == core_idx);
+
+            // Compute last_tile metadata (for starter-not-finisher case)
+            uint32_t last_tile_mac_end = (last_tile + 1) * macs_per_tile;
+            bool is_last_tile_finisher = (mac_end >= last_tile_mac_end);
+            uint32_t last_tile_other_contributors = is_last_tile_finisher ? 0 : (tile_num_contributors[last_tile] - 1);
+
+            // Compute contributor index for first tile (if not starter)
+            uint32_t first_tile_contributor_idx = is_first_tile_starter ? 0 : (core_idx - first_tile_starter_idx);
 
             // Set arguments for the reader kernel (data input)
             tt_metal::SetRuntimeArgs(
@@ -595,16 +647,20 @@ void matmul_streamk(
                     Nt,                           // Number of tiles in N dimension
                     target_num_cores,             // Total number of cores
                     num_output_tiles_total,
-                    macs_per_tile,      // MAC iters per output tile
-                    macs_per_core,      // MAC iters per core
-                    total_macs,         // Total number of MAC iterations across whole problem
-                    mac_start,          // Starting MAC iteration for this core
-                    mac_end,            // Ending MAC iteration for this core
-                    my_x,               // This core's x
-                    my_y,               // This core's y
-                    peer_x,             // Peer core's x (previous core)
-                    peer_y,             // Peer core's y (previous core)
-                    partials_ready_sem  // partials_ready_sem id
+                    macs_per_tile,                    // MAC iters per output tile
+                    macs_per_core,                    // MAC iters per core
+                    total_macs,                       // Total number of MAC iterations across whole problem
+                    mac_start,                        // Starting MAC iteration for this core
+                    mac_end,                          // Ending MAC iteration for this core
+                    my_x,                             // This core's x
+                    my_y,                             // This core's y
+                    first_tile_starter.x,             // Starter core's x for first tile
+                    first_tile_starter.y,             // Starter core's y for first tile
+                    partials_ready_sem,               // partials_ready_sem id
+                    is_first_tile_starter ? 1u : 0u,  // Is this core the starter for its first tile?
+                    first_tile_contributor_idx,       // Contributor index for first tile (0 if starter)
+                    last_tile_other_contributors,     // Num other contributors for last tile (0 if finisher)
+                    max_contributors                  // Max contributors per tile (for CB sizing)
                 });
 
             tt_metal::SetRuntimeArgs(
@@ -619,16 +675,20 @@ void matmul_streamk(
                     Nt,                           // Number of tiles in N dimension
                     target_num_cores,             // Total number of cores
                     num_output_tiles_total,
-                    macs_per_tile,      // MAC iters per output tile
-                    macs_per_core,      // MAC iters per core
-                    total_macs,         // Total number of MAC iterations across whole problem
-                    mac_start,          // Starting MAC iteration for this core
-                    mac_end,            // Ending MAC iteration for this core
-                    my_x,               // This core's x
-                    my_y,               // This core's y
-                    peer_x,             // Peer core's x (previous core)
-                    peer_y,             // Peer core's y (previous core)
-                    partials_ready_sem  // partials_ready_sem id
+                    macs_per_tile,                    // MAC iters per output tile
+                    macs_per_core,                    // MAC iters per core
+                    total_macs,                       // Total number of MAC iterations across whole problem
+                    mac_start,                        // Starting MAC iteration for this core
+                    mac_end,                          // Ending MAC iteration for this core
+                    my_x,                             // This core's x
+                    my_y,                             // This core's y
+                    first_tile_starter.x,             // Starter core's x for first tile
+                    first_tile_starter.y,             // Starter core's y for first tile
+                    partials_ready_sem,               // partials_ready_sem id
+                    is_first_tile_starter ? 1u : 0u,  // Is this core the starter for its first tile?
+                    first_tile_contributor_idx,       // Contributor index for first tile (0 if starter)
+                    last_tile_other_contributors,     // Num other contributors for last tile (0 if finisher)
+                    max_contributors                  // Max contributors per tile (for CB sizing)
                 });
 
             tt_metal::SetRuntimeArgs(
@@ -642,16 +702,20 @@ void matmul_streamk(
                     Nt,                          // Number of tiles in N dimension
                     target_num_cores,            // Total number of cores
                     num_output_tiles_total,
-                    macs_per_tile,      // MAC iters per output tile
-                    macs_per_core,      // MAC iters per core
-                    total_macs,         // Total number of MAC iterations across whole problem
-                    mac_start,          // Starting MAC iteration for this core
-                    mac_end,            // Ending MAC iteration for this core
-                    my_x,               // This core's x
-                    my_y,               // This core's y
-                    peer_x,             // Peer core's x (previous core)
-                    peer_y,             // Peer core's y (previous core)
-                    partials_ready_sem  // partials_ready_sem id
+                    macs_per_tile,                    // MAC iters per output tile
+                    macs_per_core,                    // MAC iters per core
+                    total_macs,                       // Total number of MAC iterations across whole problem
+                    mac_start,                        // Starting MAC iteration for this core
+                    mac_end,                          // Ending MAC iteration for this core
+                    my_x,                             // This core's x
+                    my_y,                             // This core's y
+                    first_tile_starter.x,             // Starter core's x for first tile
+                    first_tile_starter.y,             // Starter core's y for first tile
+                    partials_ready_sem,               // partials_ready_sem id
+                    is_first_tile_starter ? 1u : 0u,  // Is this core the starter for its first tile?
+                    first_tile_contributor_idx,       // Contributor index for first tile (0 if starter)
+                    last_tile_other_contributors,     // Num other contributors for last tile (0 if finisher)
+                    max_contributors                  // Max contributors per tile (for CB sizing)
                 });
 
             // Update previous core for next iteration (both logical and physical)

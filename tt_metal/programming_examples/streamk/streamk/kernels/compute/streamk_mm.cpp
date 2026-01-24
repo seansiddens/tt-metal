@@ -9,34 +9,16 @@ using std::uint32_t;
 
 namespace NAMESPACE {
 /**
- * @brief Main kernel function for multi-core matrix multiplication (BMM).
+ * @brief StreamK compute kernel with N-way partial tile accumulation support.
  *
- * This function performs a blocked outer product matrix multiplication using tiles.
- * It initializes the matrix engine (FPU) and sets up circular buffers for input and output.
- * For each output tile (indexed by i), it:
- *   - Acquires the destination buffer.
- *   - Iterates over the K dimension (kt), waiting for input tiles to be available in the circular buffers.
- *   - Performs a tile-wise matrix multiplication using `matmul_tiles`.
- *   - Pops the used tiles from the input buffers.
- *   - After processing all K tiles, reserves space in the output buffer, packs the result tile, and pushes it to the
- *     output buffer.
- *   - Releases the destination buffer.
- *
- * Runtime arguments:
- *   - num_porduced_tiles: Number of output tiles to produce.
- *   - Kt: Number of tiles in the reduction dimension.
- *
- * Circular buffers:
- *   - cb_in0: Input buffer for matrix A tiles.
- *   - cb_in1: Input buffer for matrix B tiles.
- *   - cb_out: Output buffer for result tiles.
- *
- * Assumes that input tiles are provided in the correct order and that the reader is responsible for supplying
- * the appropriate tiles for each output tile computation.
+ * This kernel handles matrix multiplication with arbitrary tile splits across cores.
+ * For each output tile, the kernel:
+ *   - Computes its assigned portion of MAC iterations
+ *   - If not the starter: outputs partial for writer to send to starter
+ *   - If starter but not finisher: accumulates partials from all other contributors
+ *   - If starter and finisher: outputs directly
  */
 void MAIN {
-    // uint32_t num_output_tiles = get_arg_val<uint32_t>(0);  // number of output tiles to produce
-    // uint32_t Kt = get_arg_val<uint32_t>(1);                // number of tiles in K dimension for dot product
     uint32_t arg_idx = 0;
     uint32_t src0_addr = get_arg_val<uint32_t>(arg_idx++);
     uint32_t src1_addr = get_arg_val<uint32_t>(arg_idx++);
@@ -52,9 +34,13 @@ void MAIN {
     uint32_t mac_end = get_arg_val<uint32_t>(arg_idx++);
     uint32_t my_x = get_arg_val<uint32_t>(arg_idx++);
     uint32_t my_y = get_arg_val<uint32_t>(arg_idx++);
-    uint32_t peer_x = get_arg_val<uint32_t>(arg_idx++);
-    uint32_t peer_y = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t first_tile_starter_x = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t first_tile_starter_y = get_arg_val<uint32_t>(arg_idx++);
     uint32_t partials_ready_sem = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t is_first_tile_starter = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t first_tile_contributor_idx = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t last_tile_other_contributors = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t max_contributors = get_arg_val<uint32_t>(arg_idx++);
 
     constexpr tt::CBIndex cb_in0 = tt::CBIndex::c_0;
     constexpr tt::CBIndex cb_in1 = tt::CBIndex::c_1;
@@ -63,12 +49,14 @@ void MAIN {
 
     constexpr uint32_t dst_reg = 0;
 
-    // Setup the FPU (matrix engine) for the matmul operation. And specify the input
-    // and output circular buffers.
+    // Setup the FPU (matrix engine) for the matmul operation
     mm_init(cb_in0, cb_in1, cb_out);
 
-    // Stream-K compute kernel: Process MAC iterations assigned to this core.
-    // Use while loop based on tile boundaries, matching the pseudocode structure.
+    // Determine first and last tiles this core works on
+    uint32_t first_tile = mac_start / macs_per_tile;
+    uint32_t last_tile = (mac_end > 0) ? (mac_end - 1) / macs_per_tile : first_tile;
+
+    // Stream-K compute kernel: Process MAC iterations assigned to this core
     uint32_t iter = mac_start;
     uint32_t iter_end = mac_end;
 
@@ -83,14 +71,13 @@ void MAIN {
         uint32_t local_iter_end = (iter_end < tile_iter_end) ? (iter_end - tile_iter) : (tile_iter_end - tile_iter);
 
         // MacLoop: Perform the range of MAC iterations for this tile
-        // Initialize accumulator for this tile
         tile_regs_acquire();
         for (uint32_t k_idx = local_iter; k_idx < local_iter_end; k_idx++) {
             // Wait for the input tiles (A and B) from the reader
             cb_wait_front(cb_in0, 1);
             cb_wait_front(cb_in1, 1);
 
-            // Perform the tile-wise matrix multiplication (acumulates into registers)
+            // Perform the tile-wise matrix multiplication (accumulates into registers)
             matmul_tiles(cb_in0, cb_in1, 0, 0, dst_reg);
 
             // Pop the input tiles since we've consumed them
@@ -98,21 +85,18 @@ void MAIN {
             cb_pop_front(cb_in1, 1);
         }
 
-        // Consolidate partial-sums across cores
+        // Determine tile transition flags
         bool tile_started = (iter == tile_iter);
         bool tile_ended = (iter_end >= tile_iter_end);
 
         if (!tile_started) {
             // PARTIAL REMOTE-SEND PHASE
             // This core didn't start the tile, so send partials to the writer
-            // Writer will forward these to the core that started this tile
-            // DPRINT_PACK(DPRINT << "Compute: Before tile_regs_commit (sender) for tile " << tile_idx << ENDL());
+            // Writer will forward these to the starter core
             tile_regs_commit();
             tile_regs_wait();
 
-            // DPRINT_PACK(DPRINT << "Compute: Before cb_reserve_back(cb_out) for tile " << tile_idx << ENDL());
             cb_reserve_back(cb_out, 1);
-            // DPRINT_PACK(DPRINT << "Compute: After cb_reserve_back(cb_out) for tile " << tile_idx << ENDL());
             pack_tile(0, cb_out);
             cb_push_back(cb_out, 1);
 
@@ -120,74 +104,51 @@ void MAIN {
         } else {
             // This core started the tile
             if (!tile_ended) {
-                // PARTIALs REMOTE-RECEIVE PHASE
-                // accumulate partial sums from other cores contributing to this tile
-                // This core started but didn't finish the tile, so wait for partials from later cores
+                // PARTIALS REMOTE-RECEIVE PHASE
+                // Accumulate partial sums from other cores contributing to this tile
+                // Writer signals how many partials to expect
 
-                // Wait for partials to arrive from other cores.
-                DPRINT_PACK(DPRINT << "Compute: Before cb_wait_front(cb_id_partials) for tile " << tile_idx << ENDL());
-                cb_wait_front(cb_id_partials, 1);
-                DPRINT_PACK(DPRINT << "Compute: After cb_wait_front(cb_id_partials) for tile " << tile_idx << ENDL());
-
-                // pack_tile(dst_reg, cb_out);
-
-                // Print PARTIALS tile contents (first 2 rows, 8 cols for brevity)
-                DPRINT_PACK(DPRINT << "===== PARTIALS TILE " << tile_idx << " (from sender) =====" << ENDL());
-                for (uint8_t r = 0; r < 2; ++r) {
-                    SliceRange sr =
-                        SliceRange{.h0 = r, .h1 = static_cast<uint8_t>(r + 1), .hs = 1, .w0 = 0, .w1 = 8, .ws = 1};
-                    DPRINT_PACK({
-                        DPRINT << "Partials Row " << (uint)r << ": " << TileSlice(cb_id_partials, 0, sr, true, false)
-                               << ENDL();
-                    });
+                // Determine how many partials to accumulate
+                uint32_t num_partials;
+                if (tile_idx == last_tile) {
+                    num_partials = last_tile_other_contributors;
+                } else {
+                    // Should not happen for tiles before last if started but not ended
+                    DPRINT_PACK(DPRINT << "ERROR: non-last tile but started and not ended" << ENDL());
+                    num_partials = 0;
                 }
 
-                // // Print full OUT tile contents BEFORE add (it should have accumulated data from this core's MACs)
-                // DPRINT_PACK(DPRINT << "===== OUT TILE " << tile_idx << " BEFORE ADD =====" << ENDL());
-                // for (uint8_t r = 0; r < 32; ++r) {
-                //     SliceRange sr = SliceRange{.h0 = r, .h1 = static_cast<uint8_t>(r + 1), .hs = 1, .w0 = 0, .w1 =
-                //     32, .ws = 1}; DPRINT_PACK({ DPRINT << "OutBefore Row " << (uint)r << ": " << TileSlice(cb_out, 0,
-                //     sr, true, false) << ENDL(); });
-                // }
+                DPRINT_PACK(
+                    DPRINT << "Compute: tile " << tile_idx << " accumulating " << num_partials << " partials"
+                           << ENDL());
 
-                // // Pack regs to cb_out
-                // tile_regs_acquire();
-                // add_tiles(cb_id_partials, cb_out, 0, 0, dst_reg);
+                // Wait for all partials and accumulate them one by one
+                for (uint32_t p = 0; p < num_partials; p++) {
+                    // Wait for this partial to arrive from writer
+                    cb_wait_front(cb_id_partials, 1);
 
-                // dst_reg still holds the accumulator from the MAC loop above (lines 87-99)
-                // Do NOT call tile_regs_acquire() again - that would clear the accumulator!
-                binary_dest_reuse_tiles_init<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_id_partials);
-                binary_dest_reuse_tiles<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_id_partials, 0, dst_reg);
+                    // Accumulate: dst_reg += partial
+                    binary_dest_reuse_tiles_init<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_id_partials);
+                    binary_dest_reuse_tiles<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(
+                        cb_id_partials, 0, dst_reg);
 
-                // Release the held register
+                    cb_pop_front(cb_id_partials, 1);
+                }
+
+                // Pack final accumulated result
                 tile_regs_commit();
                 tile_regs_wait();
 
-                DPRINT_PACK(DPRINT << "Compute: Before cb_reserve_back(cb_out) for tile " << tile_idx << ENDL());
                 cb_reserve_back(cb_out, 1);
-                DPRINT_PACK(DPRINT << "Compute: After cb_reserve_back(cb_out) for tile " << tile_idx << ENDL());
                 pack_tile(dst_reg, cb_out);
-
-                // Print final OUT tile contents AFTER adding partials (first 2 rows, 8 cols)
-                DPRINT_PACK(DPRINT << "===== OUT TILE " << tile_idx << " AFTER ADD AND PACK =====" << ENDL());
-                for (uint8_t r = 0; r < 2; ++r) {
-                    SliceRange sr =
-                        SliceRange{.h0 = r, .h1 = static_cast<uint8_t>(r + 1), .hs = 1, .w0 = 0, .w1 = 8, .ws = 1};
-                    DPRINT_PACK({
-                        DPRINT << "OutAfter Row " << (uint)r << ": " << TileSlice(cb_out, 0, sr, true, false) << ENDL();
-                    });
-                }
-
                 cb_push_back(cb_out, 1);
-                // DPRINT_PACK(DPRINT << "Compute: After cb_push_back(cb_out) for tile " << tile_idx << ENDL());
 
                 tile_regs_release();
-                cb_pop_front(cb_id_partials, 1);
 
-                // Reset SFPU state for mm
+                // Reset SFPU state for mm (next iteration)
                 mm_init(cb_in0, cb_in1, cb_out);
             } else {
-                // tile_started && tile_ended: this core both starts and finishes the tile (simple case)
+                // tile_started && tile_ended: this core both starts and finishes the tile
                 tile_regs_commit();
                 tile_regs_wait();
 
@@ -201,6 +162,6 @@ void MAIN {
 
         iter = tile_iter_end;
     }
-    DPRINT << "All Compute Finished" << ENDL();
+    DPRINT << "Compute finished" << ENDL();
 }
 }  // namespace NAMESPACE

@@ -20,9 +20,15 @@ void kernel_main() {
     uint32_t mac_end = get_arg_val<uint32_t>(arg_idx++);
     uint32_t my_x = get_arg_val<uint32_t>(arg_idx++);
     uint32_t my_y = get_arg_val<uint32_t>(arg_idx++);
-    uint32_t peer_x = get_arg_val<uint32_t>(arg_idx++);
-    uint32_t peer_y = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t first_tile_starter_x = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t first_tile_starter_y = get_arg_val<uint32_t>(arg_idx++);
     uint32_t partials_ready_sem = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t is_first_tile_starter = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t first_tile_contributor_idx = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t last_tile_other_contributors = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t max_contributors = get_arg_val<uint32_t>(arg_idx++);
+
+    // Note: Reader doesn't use most of these args, but must consume them to match runtime args
 
     constexpr uint32_t cb_id_in0 = tt::CBIndex::c_0;
     constexpr uint32_t cb_id_in1 = tt::CBIndex::c_1;
