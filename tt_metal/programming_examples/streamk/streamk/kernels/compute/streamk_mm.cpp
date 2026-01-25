@@ -122,13 +122,15 @@ void MAIN {
                     DPRINT << "Compute: tile " << tile_idx << " accumulating " << num_partials << " partials"
                            << ENDL());
 
+                // Initialize the binary op ONCE before the loop (not per-partial!)
+                binary_dest_reuse_tiles_init<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_id_partials);
+
                 // Wait for all partials and accumulate them one by one
                 for (uint32_t p = 0; p < num_partials; p++) {
                     // Wait for this partial to arrive from writer
                     cb_wait_front(cb_id_partials, 1);
 
-                    // Accumulate: dst_reg += partial
-                    binary_dest_reuse_tiles_init<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_id_partials);
+                    // Accumulate: dst_reg += partial (init already done outside loop)
                     binary_dest_reuse_tiles<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(
                         cb_id_partials, 0, dst_reg);
 

@@ -90,13 +90,13 @@ void kernel_main() {
 
             uint64_t peer_noc_addr = get_noc_addr(starter_x, starter_y, local_cb_partials_addr + offset);
             noc_async_write(l1_read_addr, peer_noc_addr, tile_bytes);
-            noc_async_write_barrier();
+            noc_async_write_barrier();  // Ensure data arrives before signaling
 
-            // Signal to starter that this partial is ready
+            // Signal to starter that this partial is ready (use posted mode for efficiency)
             uint32_t sem_addr = get_semaphore(partials_ready_sem);
             uint64_t peer_sem_noc = get_noc_addr(starter_x, starter_y, sem_addr);
-            noc_semaphore_inc(peer_sem_noc, 1);
-            noc_async_atomic_barrier();
+            noc_semaphore_inc<true>(peer_sem_noc, 1);  // Posted - more efficient
+            noc_async_posted_writes_flushed();         // Ensure signal is sent before moving on
 
             DPRINT << "SENDER tile " << tile_idx << ": signaled starter" << ENDL();
 
@@ -126,8 +126,8 @@ void kernel_main() {
                 uint32_t sem_addr = get_semaphore(partials_ready_sem);
                 volatile tt_l1_ptr uint32_t* sem_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sem_addr);
 
-                // Wait for semaphore to reach expected count
-                noc_semaphore_wait(sem_ptr, num_partials_to_receive);
+                // Wait for semaphore to reach expected count (use wait_min for >= comparison)
+                noc_semaphore_wait_min(sem_ptr, num_partials_to_receive);
                 noc_semaphore_set(sem_ptr, 0);  // Reset for future tiles
 
                 DPRINT << "REDUCER tile " << tile_idx << ": all partials arrived" << ENDL();

@@ -16,6 +16,9 @@
 #include <fmt/base.h>
 #include <fmt/core.h>
 
+// Trace region size for accurate performance measurement (16MB)
+constexpr size_t TRACE_REGION_SIZE = 16 << 20;
+
 uint32_t ceil_div(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
 
 using namespace tt::constants;
@@ -313,29 +316,33 @@ void matmul_multi_core(
         distributed::EnqueueMeshWorkload(cq, workload, true);
     }
 
-    // Benchmark iterations with timing
+    // Capture trace for accurate timing (eliminates host dispatch overhead)
     constexpr uint32_t bench_iterations = 10;
-    std::vector<int64_t> execution_times;
-    execution_times.reserve(bench_iterations);
+    fmt::print("Capturing trace for {} iterations...\n", bench_iterations);
 
-    fmt::print("Running {} benchmark iterations...\n", bench_iterations);
+    auto trace_id = distributed::BeginTraceCapture(mesh_device.get(), cq.id());
     for (uint32_t iter = 0; iter < bench_iterations; ++iter) {
-        auto start_time = std::chrono::high_resolution_clock::now();
-        distributed::EnqueueMeshWorkload(cq, workload, true);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        execution_times.push_back(elapsed_us);
+        distributed::EnqueueMeshWorkload(cq, workload, false);
     }
+    mesh_device->end_mesh_trace(cq.id(), trace_id);
 
-    // Print individual times and calculate average
-    fmt::print("\nExecution times:\n");
-    int64_t total_us = 0;
-    for (size_t i = 0; i < execution_times.size(); ++i) {
-        fmt::print("  Iteration {}: {} us ({:.3f} ms)\n", i, execution_times[i], execution_times[i] / 1000.0);
-        total_us += execution_times[i];
-    }
-    double avg_us = static_cast<double>(total_us) / execution_times.size();
-    fmt::print("Average execution time: {:.2f} us ({:.3f} ms)\n\n", avg_us, avg_us / 1000.0);
+    // Time the trace replay (this excludes host dispatch overhead)
+    fmt::print("Running traced benchmark...\n");
+    auto start_time = std::chrono::high_resolution_clock::now();
+    mesh_device->replay_mesh_trace(cq.id(), trace_id, false);
+    distributed::Synchronize(mesh_device.get(), cq.id());
+    auto end_time = std::chrono::high_resolution_clock::now();
+
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    double avg_us = static_cast<double>(elapsed_us) / bench_iterations;
+    fmt::print(
+        "Average execution time: {:.2f} us ({:.3f} ms) [traced, {} iterations]\n\n",
+        avg_us,
+        avg_us / 1000.0,
+        bench_iterations);
+
+    // Release trace
+    mesh_device->release_mesh_trace(trace_id);
 
     // Blocking read waits for completion before returning and resizes 'output' as needed
     distributed::EnqueueReadMeshBuffer(cq, output, dst_dram_buffer, true);
@@ -737,35 +744,39 @@ void matmul_streamk(
         distributed::EnqueueMeshWorkload(cq, workload, true);
     }
 
-    // Benchmark iterations with timing
+    // Capture trace for accurate timing (eliminates host dispatch overhead)
     constexpr uint32_t bench_iterations = 10;
-    std::vector<int64_t> execution_times;
-    execution_times.reserve(bench_iterations);
+    fmt::print("Capturing trace for {} iterations...\n", bench_iterations);
 
-    fmt::print("Running {} benchmark iterations...\n", bench_iterations);
+    auto trace_id = distributed::BeginTraceCapture(mesh_device.get(), cq.id());
     for (uint32_t iter = 0; iter < bench_iterations; ++iter) {
-        auto start_time = std::chrono::high_resolution_clock::now();
-        distributed::EnqueueMeshWorkload(cq, workload, true);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        execution_times.push_back(elapsed_us);
+        distributed::EnqueueMeshWorkload(cq, workload, false);
     }
+    mesh_device->end_mesh_trace(cq.id(), trace_id);
 
-    // Print individual times and calculate average
-    fmt::print("\nExecution times:\n");
-    int64_t total_us = 0;
-    for (size_t i = 0; i < execution_times.size(); ++i) {
-        fmt::print("  Iteration {}: {} us ({:.3f} ms)\n", i, execution_times[i], execution_times[i] / 1000.0);
-        total_us += execution_times[i];
-    }
-    double avg_us = static_cast<double>(total_us) / execution_times.size();
-    fmt::print("Average execution time: {:.2f} us ({:.3f} ms)\n", avg_us, avg_us / 1000.0);
+    // Time the trace replay (this excludes host dispatch overhead)
+    fmt::print("Running traced benchmark...\n");
+    auto start_time = std::chrono::high_resolution_clock::now();
+    mesh_device->replay_mesh_trace(cq.id(), trace_id, false);
+    distributed::Synchronize(mesh_device.get(), cq.id());
+    auto end_time = std::chrono::high_resolution_clock::now();
+
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    double avg_us = static_cast<double>(elapsed_us) / bench_iterations;
+    fmt::print(
+        "Average execution time: {:.2f} us ({:.3f} ms) [traced, {} iterations]\n",
+        avg_us,
+        avg_us / 1000.0,
+        bench_iterations);
 
     // Calculate and print TFLOPs
     double flops = 2.0 * M * N * K;  // multiply-add
     double time_s = avg_us / 1e6;
     double tflops = flops / (time_s * 1e12);
     fmt::print("Average throughput:     {:.3f} TFLOPs\n\n", tflops);
+
+    // Release trace
+    mesh_device->release_mesh_trace(trace_id);
 
     // Read back the result from DRAM to host memory
     distributed::EnqueueReadMeshBuffer(cq, output, dst_dram_buffer, true);
@@ -782,7 +793,13 @@ int main(int argc, char** argv) {
 
     try {
         constexpr int device_id = 0;
-        std::shared_ptr<distributed::MeshDevice> mesh_device = distributed::MeshDevice::create_unit_mesh(device_id);
+        // Create mesh device with trace region enabled for accurate performance measurement
+        // The trace region allows capturing kernel execution without host dispatch overhead
+        std::shared_ptr<distributed::MeshDevice> mesh_device = distributed::MeshDevice::create_unit_mesh(
+            device_id,
+            DEFAULT_L1_SMALL_SIZE,  // l1_small_size
+            TRACE_REGION_SIZE       // trace_region_size (16MB for tracing)
+        );
 
         // Parse command-line arguments for matrix dimensions (defaults: M=640, N=640, K=640)
         // Optional named arguments:
